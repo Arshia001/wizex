@@ -1,8 +1,8 @@
 use rayon::iter::{IntoParallelIterator, ParallelExtend, ParallelIterator};
 use std::convert::TryFrom;
-use wasmtime::{AsContext, AsContextMut};
+use wasmer::{AsStoreMut, AsStoreRef};
 
-const WASM_PAGE_SIZE: u64 = 65_536;
+const WASM_PAGE_SIZE: u32 = 65_536;
 
 /// The maximum number of data segments that we will emit. Most
 /// engines support more than this, but we want to leave some
@@ -12,26 +12,23 @@ const MAX_DATA_SEGMENTS: usize = 10_000;
 /// A "snapshot" of Wasm state from its default value after having been initialized.
 pub struct Snapshot {
     /// Maps global index to its initialized value.
-    pub globals: Vec<wasmtime::Val>,
+    pub globals: Vec<wasmer::Value>,
 
     /// A new minimum size for each memory (in units of pages).
-    pub memory_mins: Vec<u64>,
+    pub memory_mins: Vec<u32>,
 
     /// Segments of non-zero memory.
     pub data_segments: Vec<DataSegment>,
-
-    /// Snapshots for each nested instantiation.
-    pub instantiations: Vec<Snapshot>,
 }
 
 /// A data segment initializer for a memory.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DataSegment {
     /// The index of this data segment's memory.
     pub memory_index: u32,
 
     /// This data segment's initialized memory that it originated from.
-    pub memory: wasmtime::Memory,
+    pub memory: wasmer::Memory,
 
     /// The offset within the memory that `data` should be copied to.
     pub offset: u32,
@@ -41,10 +38,10 @@ pub struct DataSegment {
 }
 
 impl DataSegment {
-    pub fn data<'a>(&self, ctx: &'a impl AsContext) -> &'a [u8] {
+    pub fn data(&self, store: &impl AsStoreRef) -> Vec<u8> {
         let start = usize::try_from(self.offset).unwrap();
         let end = start + usize::try_from(self.len).unwrap();
-        &self.memory.data(ctx)[start..end]
+        unsafe { &self.memory.view(store).data_unchecked()[start..end] }.to_vec()
     }
 }
 
@@ -69,6 +66,7 @@ impl DataSegment {
         DataSegment {
             offset: self.offset,
             len: self.len + gap + other.len,
+            memory: self.memory.clone(),
             ..*self
         }
     }
@@ -78,34 +76,29 @@ impl DataSegment {
 /// defaults.
 //
 // TODO: when we support reference types, we will have to snapshot tables.
-pub fn snapshot(ctx: &mut impl AsContextMut, instance: &wasmtime::Instance) -> Snapshot {
+pub fn snapshot(ctx: &mut impl AsStoreMut, instance: &wasmer::Instance) -> Snapshot {
     log::debug!("Snapshotting the initialized state");
 
     let globals = snapshot_globals(&mut *ctx, instance);
     let (memory_mins, data_segments) = snapshot_memories(&mut *ctx, instance);
-    let instantiations = snapshot_instantiations(&mut *ctx, instance);
 
     Snapshot {
         globals,
         memory_mins,
         data_segments,
-        instantiations,
     }
 }
 
 /// Get the initialized values of all globals.
-fn snapshot_globals(
-    ctx: &mut impl AsContextMut,
-    instance: &wasmtime::Instance,
-) -> Vec<wasmtime::Val> {
+fn snapshot_globals(ctx: &mut impl AsStoreMut, instance: &wasmer::Instance) -> Vec<wasmer::Value> {
     log::debug!("Snapshotting global values");
     let mut globals = vec![];
     let mut index = 0;
     loop {
         let name = format!("__wizer_global_{}", index);
-        match instance.get_global(&mut *ctx, &name) {
-            None => break,
-            Some(global) => {
+        match instance.exports.get_global(&name) {
+            Err(_) => break,
+            Ok(global) => {
                 globals.push(global.get(&mut *ctx));
                 index += 1;
             }
@@ -117,9 +110,9 @@ fn snapshot_globals(
 /// Find the initialized minimum page size of each memory, as well as all
 /// regions of non-zero memory.
 fn snapshot_memories(
-    ctx: &mut impl AsContextMut,
-    instance: &wasmtime::Instance,
-) -> (Vec<u64>, Vec<DataSegment>) {
+    ctx: &mut impl AsStoreMut,
+    instance: &wasmer::Instance,
+) -> (Vec<u32>, Vec<DataSegment>) {
     log::debug!("Snapshotting memories");
 
     // Find and record non-zero regions of memory (in parallel).
@@ -128,15 +121,17 @@ fn snapshot_memories(
     let mut memory_index = 0;
     loop {
         let name = format!("__wizer_memory_{}", memory_index);
-        let memory = match instance.get_memory(&mut *ctx, &name) {
-            None => break,
-            Some(memory) => memory,
+        let memory = match instance.exports.get_memory(&name) {
+            Err(_) => break,
+            Ok(memory) => memory,
         };
-        memory_mins.push(memory.size(&*ctx));
 
-        let num_wasm_pages = memory.size(&*ctx);
+        let num_wasm_pages = memory.view(&*ctx).size().0;
 
-        let memory_data = memory.data(&*ctx);
+        memory_mins.push(num_wasm_pages);
+
+        let view = memory.view(&*ctx);
+        let memory_data = unsafe { view.data_unchecked() };
 
         // Consider each Wasm page in parallel. Create data segments for each
         // region of non-zero memory.
@@ -159,7 +154,7 @@ fn snapshot_memories(
                     .map_or(page_end, |zero| start + zero);
                 segments.push(DataSegment {
                     memory_index,
-                    memory,
+                    memory: memory.clone(),
                     offset: u32::try_from(start).unwrap(),
                     len: u32::try_from(end - start).unwrap(),
                 });
@@ -188,13 +183,13 @@ fn snapshot_memories(
     // the data length LEB).
     const MIN_ACTIVE_SEGMENT_OVERHEAD: u32 = 4;
     let mut merged_data_segments = Vec::with_capacity(data_segments.len());
-    merged_data_segments.push(data_segments[0]);
+    merged_data_segments.push(data_segments[0].clone());
     for b in &data_segments[1..] {
         let a = merged_data_segments.last_mut().unwrap();
 
         // Only merge segments for the same memory.
         if a.memory_index != b.memory_index {
-            merged_data_segments.push(*b);
+            merged_data_segments.push(b.clone());
             continue;
         }
 
@@ -202,7 +197,7 @@ fn snapshot_memories(
         // more size efficient than leaving them apart.
         let gap = a.gap(b);
         if gap > MIN_ACTIVE_SEGMENT_OVERHEAD {
-            merged_data_segments.push(*b);
+            merged_data_segments.push(b.clone());
             continue;
         }
 
@@ -274,18 +269,16 @@ fn remove_excess_segments(merged_data_segments: &mut Vec<DataSegment>) {
     merged_data_segments.sort_by_key(|s| (s.memory_index, s.offset));
 }
 
-fn snapshot_instantiations(
-    ctx: &mut impl AsContextMut,
-    instance: &wasmtime::Instance,
-) -> Vec<Snapshot> {
-    log::debug!("Snapshotting nested instantiations");
-    let instantiations = vec![];
-    loop {
-        let name = format!("__wizer_instance_{}", instantiations.len());
-        match instance.get_export(&mut *ctx, &name) {
-            None => break,
-            Some(_) => unreachable!(),
-        }
-    }
-    instantiations
-}
+// TODO @wasmer: this doesn't look like it does anything?
+// fn snapshot_instantiations(instance: &wasmer::Instance) -> Vec<Snapshot> {
+//     log::debug!("Snapshotting nested instantiations");
+//     let instantiations = vec![];
+//     loop {
+//         let name = format!("__wizer_instance_{}", instantiations.len());
+//         match instance.exports.get_extern(&name) {
+//             None => break,
+//             Some(_) => unreachable!(),
+//         }
+//     }
+//     instantiations
+// }

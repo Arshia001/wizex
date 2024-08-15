@@ -1,12 +1,12 @@
 //! Final rewrite pass.
 
 use crate::{
-    info::ModuleContext, snapshot::Snapshot, translate, FuncRenames, Wizer, DEFAULT_KEEP_INIT_FUNC,
+    info::ModuleContext, snapshot::Snapshot, translate, FuncRenames, Wizex, DEFAULT_KEEP_INIT_FUNC,
 };
 use std::convert::TryFrom;
 use wasm_encoder::{ConstExpr, SectionId};
 
-impl Wizer {
+impl Wizex {
     /// Given the initialized snapshot, rewrite the Wasm so that it is already
     /// initialized.
     ///
@@ -72,7 +72,7 @@ impl Wizer {
                         .zip(snapshot.memory_mins.iter().copied())
                     {
                         let mut mem = translate::memory_type(mem);
-                        mem.minimum = new_min;
+                        mem.minimum = new_min as u64;
                         memories.memory(mem);
                     }
                     encoder.section(&memories);
@@ -89,13 +89,11 @@ impl Wizer {
                         globals.global(
                             glob_ty,
                             &match val {
-                                wasmtime::Val::I32(x) => ConstExpr::i32_const(*x),
-                                wasmtime::Val::I64(x) => ConstExpr::i64_const(*x),
-                                wasmtime::Val::F32(x) => ConstExpr::f32_const(f32::from_bits(*x)),
-                                wasmtime::Val::F64(x) => ConstExpr::f64_const(f64::from_bits(*x)),
-                                wasmtime::Val::V128(x) => {
-                                    ConstExpr::v128_const(x.as_u128() as i128)
-                                }
+                                wasmer::Value::I32(x) => ConstExpr::i32_const(*x),
+                                wasmer::Value::I64(x) => ConstExpr::i64_const(*x),
+                                wasmer::Value::F32(x) => ConstExpr::f32_const(*x),
+                                wasmer::Value::F64(x) => ConstExpr::f64_const(*x),
+                                wasmer::Value::V128(x) => ConstExpr::v128_const(*x as i128),
                                 _ => unreachable!(),
                             },
                         );

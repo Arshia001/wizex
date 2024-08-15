@@ -49,7 +49,7 @@ pub struct TypeId {
 impl TypesInterner {
     /// Get a type by id.
     pub fn get(&self, id: TypeId) -> &Type {
-        &*self.types[usize::try_from(id.index).unwrap()]
+        &self.types[usize::try_from(id.index).unwrap()]
     }
 
     /// Intern a `wasmparser` type into this type set and get its id.

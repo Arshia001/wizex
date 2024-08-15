@@ -1,3 +1,10 @@
+# WASIX fork of Wizer
+
+This is a fork of Wizer which replaces wasmtime with wasmer to add support for WASIX modules.
+The tool has been renamed to `wisex` to avoid confusion with the original.
+
+Original README follows.
+
 <div align="center">
   <h1>Wizer</h1>
 

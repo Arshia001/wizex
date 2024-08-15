@@ -13,7 +13,7 @@ struct StackEntry {
 }
 
 /// Parse the given Wasm bytes into a `ModuleInfo` tree.
-pub(crate) fn parse<'a>(full_wasm: &'a [u8]) -> anyhow::Result<ModuleContext<'a>> {
+pub(crate) fn parse(full_wasm: &[u8]) -> anyhow::Result<ModuleContext> {
     log::debug!("Parsing the input Wasm");
 
     let mut cx = ModuleContext::new();
@@ -188,10 +188,13 @@ fn check_import_type(
     match ty {
         EntityType::Function(_) => Ok(()),
         EntityType::Memory(mem_ty) => {
-            anyhow::ensure!(
-                !mem_ty.shared,
-                "shared memories are not supported by Wizer yet"
-            );
+            // TODO @wasmer: I believe shared memories can be supported with the existing
+            // code, as long as the initialization function doesn't spawn new threads, which
+            // would be a VERY bad idea anyway.
+            // anyhow::ensure!(
+            //     !mem_ty.shared,
+            //     "shared memories are not supported by Wizer yet"
+            // );
             anyhow::ensure!(
                 !mem_ty.memory64,
                 "the memory64 proposal is not supported by Wizer yet"

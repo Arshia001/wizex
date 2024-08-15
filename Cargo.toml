@@ -1,13 +1,12 @@
 [package]
 authors = ["Nick Fitzgerald <fitzgen@gmail.com>"]
 categories = ["command-line-utilities", "development-tools", "wasm"]
-description = "The WebAssembly Pre-Initializer"
-documentation = "https://docs.rs/wizer"
+description = "WASIX fork of wizer"
 edition = "2018"
 exclude = ["**.wasm"]
 homepage = "https://github.com/bytecodealliance/wizer"
 license = "Apache-2.0 WITH LLVM-exception"
-name = "wizer"
+name = "wizex"
 readme = "./README.md"
 repository = "https://github.com/bytecodealliance/wizer"
 version = "6.0.0"
@@ -15,7 +14,7 @@ version = "6.0.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [[bin]]
-name = "wizer"
+name = "wizex"
 required-features = ["env_logger", "structopt"]
 
 [[bench]]
@@ -31,12 +30,15 @@ anyhow = "1.0.81"
 cap-std = "3.0.0"
 env_logger = { version = "0.11", optional = true }
 log = "0.4.21"
+mio = { version = "0.8", features = ["net"] }
 rayon = "1.10.0"
 structopt = { version = "0.3.26", optional = true }
+tokio = { version = "1.39.2" }
 wasm-encoder = "0.202.0"
 wasmparser = "0.202.0"
-wasmtime = { workspace = true }
-wasi-common = { workspace = true }
+wasmer = { workspace = true }
+wasmer-wasix = { workspace = true }
+webc = "6.0.0-rc2"
 
 # Enable this dependency to get messages with WAT disassemblies when certain
 # internal panics occur.
@@ -46,15 +48,15 @@ optional = true
 
 [workspace.dependencies]
 wasmprinter = "0.202.0"
-wasmtime = "19"
-wasi-common = "19"
+wasmer = "4.3.5"
+wasmer-wasix = "0.25"
 
 
 [dev-dependencies]
 criterion = "0.5.1"
 env_logger = "0.11.3"
 wasmprinter = { workspace = true }
-wat = "1.202.0"
+wat = "1.0.71"
 
 [workspace]
 members = [
@@ -66,3 +68,6 @@ members = [
 
 [profile.bench]
 debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(fuzzing)'] }

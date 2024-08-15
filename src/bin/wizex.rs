@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use structopt::StructOpt;
-use wizer::Wizer;
+use wizex::Wizex;
 
 #[derive(StructOpt)]
 pub struct Options {
@@ -20,10 +20,13 @@ pub struct Options {
     output: Option<PathBuf>,
 
     #[structopt(flatten)]
-    wizer: Wizer,
+    wizer: Wizex,
 }
 
-fn main() -> anyhow::Result<()> {
+// Most of the WASIX code requires a tokio runtime, so let's set one up here all the
+// way at the top.
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let options = Options::from_args();
 

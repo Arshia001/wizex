@@ -35,7 +35,7 @@ impl<'a> ModuleContext<'a> {
     /// following through aliases.
     fn defined(&self, module: Module) -> &DefinedModuleInfo<'a> {
         match &self.arena[module.id] {
-            ModuleInfo::Defined(d) => return d,
+            ModuleInfo::Defined(d) => d,
         }
     }
 
@@ -146,7 +146,7 @@ impl Module {
     }
 
     /// Push a new type into this module's types space.
-    pub fn push_type<'a>(self, cx: &mut ModuleContext<'a>, ty: wasmparser::CompositeType) {
+    pub fn push_type(self, cx: &mut ModuleContext, ty: wasmparser::CompositeType) {
         let types_space = match &cx.arena[self.id] {
             ModuleInfo::Defined(d) => &d.types,
         };
@@ -290,7 +290,7 @@ impl Module {
     }
 
     /// Get the full types index space for this module.
-    pub fn types<'a, 'b>(self, cx: &'b ModuleContext<'a>) -> &'b [TypeId] {
+    pub fn types<'a>(self, cx: &'a ModuleContext) -> &'a [TypeId] {
         &cx.defined(self).types
     }
 

@@ -17,21 +17,25 @@ mod snapshot;
 mod stack_ext;
 mod translate;
 
-use wasi_common::sync::WasiCtxBuilder;
-/// Re-export wasmtime so users can align with our version. This is
-/// especially useful when providing a custom Linker.
-pub use wasmtime;
+/// Re-export wasmer so users can align with our version.
+pub use wasmer;
 
 use anyhow::Context;
 use dummy::dummy_imports;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 #[cfg(feature = "structopt")]
 use structopt::StructOpt;
-use wasi_common::WasiCtx;
-use wasmtime::{Engine, Extern};
+use wasmer::{sys::Features, Cranelift, Engine, Extern, Imports, NativeEngineExt, Store, Target};
+use wasmer_wasix::{
+    runners::{wasi::WasiRunner, MappedDirectory},
+    runtime::task_manager::tokio::{RuntimeOrHandle, TokioTaskManager},
+    virtual_fs::NullFile,
+    PluggableRuntime, Runtime,
+};
+use webc::metadata::annotations::Wasi;
 
 const DEFAULT_INHERIT_STDIO: bool = true;
 const DEFAULT_INHERIT_ENV: bool = false;
@@ -41,15 +45,8 @@ const DEFAULT_WASM_MULTI_MEMORY: bool = true;
 const DEFAULT_WASM_BULK_MEMORY: bool = false;
 const DEFAULT_WASM_SIMD: bool = true;
 
-/// We only ever use `Store<T>` with a fixed `T` that is our optional WASI
-/// context.
-pub(crate) type Store = wasmtime::Store<Option<WasiCtx>>;
-
-/// The type of linker that Wizer uses when evaluating the initialization function.
-pub type Linker = wasmtime::Linker<Option<WasiCtx>>;
-
 #[cfg(feature = "structopt")]
-fn parse_map_dirs(s: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn parse_map_dirs(s: &str) -> anyhow::Result<(String, PathBuf)> {
     let parts: Vec<&str> = s.split("::").collect();
     if parts.len() != 2 {
         anyhow::bail!("must contain exactly one double colon ('::')");
@@ -80,7 +77,7 @@ fn parse_map_dirs(s: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
 ///   difficult.
 #[cfg_attr(feature = "structopt", derive(StructOpt))]
 #[derive(Clone)]
-pub struct Wizer {
+pub struct Wizex {
     /// The Wasm export name of the function that should be executed to
     /// initialize the Wasm module.
     #[cfg_attr(
@@ -114,51 +111,22 @@ pub struct Wizer {
     )]
     func_renames: Vec<String>,
 
-    /// Allow WASI imports to be called during initialization.
+    /// Allow WASIX imports to be called during initialization.
     ///
     /// This can introduce diverging semantics because the initialization can
     /// observe nondeterminism that might have gone a different way at runtime
     /// than it did at initialization time.
     ///
-    /// If your Wasm module uses WASI's `get_random` to add randomness to
+    /// If your Wasm module uses WASIX's `get_random` to add randomness to
     /// something as a security mitigation (e.g. something akin to ASLR or the
     /// way Rust's hash maps incorporate a random nonce) then note that, if the
     /// randomization is added during initialization time and you don't ever
     /// re-randomize at runtime, then that randomization will become per-module
     /// rather than per-instance.
-    #[cfg_attr(feature = "structopt", structopt(long = "allow-wasi"))]
-    allow_wasi: bool,
+    #[cfg_attr(feature = "structopt", structopt(long = "allow-wasix"))]
+    allow_wasix: bool,
 
-    /// Provide an additional preloaded module that is available to the
-    /// main module.
-    ///
-    /// This allows running a module that depends on imports from
-    /// another module. Note that the additional module's state is *not*
-    /// snapshotted, nor is its code included in the Wasm snapshot;
-    /// rather, it is assumed that the resulting snapshot Wasm will also
-    /// be executed with the same imports available.
-    ///
-    /// The main purpose of this option is to allow "stubs" for certain
-    /// intrinsics to be included, when these will be provided with
-    /// different implementations when running or further processing the
-    /// snapshot.
-    ///
-    /// The format of this option is `name=file.{wasm,wat}`; e.g.,
-    /// `intrinsics=stubs.wat`. Multiple instances of the option may
-    /// appear.
-    #[cfg_attr(feature = "structopt", structopt(long = "preload"))]
-    preload: Vec<String>,
-
-    /// Like `preload` above, but with the module contents provided,
-    /// rather than a filename. This is more useful for programmatic
-    /// use-cases where the embedding tool may also embed a Wasm module.
-    #[cfg_attr(feature = "structopt", structopt(skip))]
-    preload_bytes: Vec<(String, Vec<u8>)>,
-
-    #[cfg_attr(feature = "structopt", structopt(skip))]
-    make_linker: Option<Rc<dyn Fn(&wasmtime::Engine) -> anyhow::Result<Linker>>>,
-
-    /// When using WASI during initialization, should `stdin`, `stderr`, and
+    /// When using WASIX during initialization, should `stdin`, `stderr`, and
     /// `stdout` be inherited?
     ///
     /// This is true by default.
@@ -168,7 +136,7 @@ pub struct Wizer {
     )]
     inherit_stdio: Option<bool>,
 
-    /// When using WASI during initialization, should environment variables be
+    /// When using WASIX during initialization, should environment variables be
     /// inherited?
     ///
     /// This is false by default.
@@ -189,7 +157,7 @@ pub struct Wizer {
     )]
     keep_init_func: Option<bool>,
 
-    /// When using WASI during initialization, which file system directories
+    /// When using WASIX during initialization, which file system directories
     /// should be made available?
     ///
     /// None are available by default.
@@ -199,7 +167,7 @@ pub struct Wizer {
     )]
     dirs: Vec<PathBuf>,
 
-    /// When using WASI during initialization, which guest directories should be
+    /// When using WASIX during initialization, which guest directories should be
     /// mapped to a host directory?
     ///
     /// The `--mapdir` option differs from `--dir` in that it allows giving a
@@ -211,7 +179,7 @@ pub struct Wizer {
         feature = "structopt",
         structopt(long = "mapdir", value_name = "GUEST_DIR::HOST_DIR", parse(try_from_str = parse_map_dirs))
     )]
-    map_dirs: Vec<(PathBuf, PathBuf)>,
+    map_dirs: Vec<(String, PathBuf)>,
 
     /// Enable or disable Wasm multi-memory proposal.
     ///
@@ -242,15 +210,12 @@ pub struct Wizer {
     wasm_simd: Option<bool>,
 }
 
-impl std::fmt::Debug for Wizer {
+impl std::fmt::Debug for Wizex {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let Wizer {
+        let Wizex {
             init_func,
             func_renames,
-            allow_wasi,
-            preload,
-            preload_bytes,
-            make_linker: _,
+            allow_wasix,
             inherit_stdio,
             inherit_env,
             keep_init_func,
@@ -264,9 +229,7 @@ impl std::fmt::Debug for Wizer {
         f.debug_struct("Wizer")
             .field("init_func", &init_func)
             .field("func_renames", &func_renames)
-            .field("allow_wasi", &allow_wasi)
-            .field("preload", &preload)
-            .field("preload_bytes", &preload_bytes)
+            .field("allow_wasix", &allow_wasix)
             .field("make_linker", &"..")
             .field("inherit_stdio", &inherit_stdio)
             .field("inherit_env", &inherit_env)
@@ -322,16 +285,19 @@ impl FuncRenames {
     }
 }
 
-impl Wizer {
+impl Default for Wizex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Wizex {
     /// Construct a new `Wizer` builder.
     pub fn new() -> Self {
-        Wizer {
+        Wizex {
             init_func: "wizer.initialize".into(),
             func_renames: vec![],
-            allow_wasi: false,
-            preload: vec![],
-            preload_bytes: vec![],
-            make_linker: None,
+            allow_wasix: false,
             inherit_stdio: None,
             inherit_env: None,
             keep_init_func: None,
@@ -358,7 +324,7 @@ impl Wizer {
         self
     }
 
-    /// Allow WASI imports to be called during initialization?
+    /// Allow WASIX imports to be called during initialization?
     ///
     /// This can introduce diverging semantics because the initialization can
     /// observe nondeterminism that might have gone a different way at runtime
@@ -372,93 +338,12 @@ impl Wizer {
     /// rather than per-instance.
     ///
     /// Defaults to `false`.
-    pub fn allow_wasi(&mut self, allow: bool) -> anyhow::Result<&mut Self> {
-        anyhow::ensure!(
-            self.make_linker.is_none(),
-            "Cannot use 'allow_wasi' with a custom linker"
-        );
-        self.allow_wasi = allow;
+    pub fn allow_wasix(&mut self, allow: bool) -> anyhow::Result<&mut Self> {
+        self.allow_wasix = allow;
         Ok(self)
     }
 
-    /// Provide an additional preloaded module that is available to the
-    /// main module.
-    ///
-    /// This allows running a module that depends on imports from
-    /// another module. Note that the additional module's state is *not*
-    /// snapshotted, nor is its code included in the Wasm snapshot;
-    /// rather, it is assumed that the resulting snapshot Wasm will also
-    /// be executed with the same imports available.
-    ///
-    /// The main purpose of this option is to allow "stubs" for certain
-    /// intrinsics to be included, when these will be provided with
-    /// different implementations when running or further processing the
-    /// snapshot.
-    pub fn preload(&mut self, name: &str, filename: &str) -> anyhow::Result<&mut Self> {
-        anyhow::ensure!(
-            self.make_linker.is_none(),
-            "Cannot use 'preload' with a custom linker"
-        );
-        anyhow::ensure!(
-            !name.contains("="),
-            "Module name cannot contain an `=` character"
-        );
-        self.preload.push(format!("{}={}", name, filename));
-        Ok(self)
-    }
-
-    /// Provide an additional preloaded module that is available to the
-    /// main module. Unlike `preload()`, this method takes an owned
-    /// vector of bytes as the module's actual content, rather than a
-    /// filename. As with `preload()`, the module may be in Wasm binary
-    /// format or in WAT text format.
-    ///
-    /// This allows running a module that depends on imports from
-    /// another module. Note that the additional module's state is *not*
-    /// snapshotted, nor is its code included in the Wasm snapshot;
-    /// rather, it is assumed that the resulting snapshot Wasm will also
-    /// be executed with the same imports available.
-    ///
-    /// The main purpose of this option is to allow "stubs" for certain
-    /// intrinsics to be included, when these will be provided with
-    /// different implementations when running or further processing the
-    /// snapshot.
-    pub fn preload_bytes(
-        &mut self,
-        name: &str,
-        module_bytes: Vec<u8>,
-    ) -> anyhow::Result<&mut Self> {
-        anyhow::ensure!(
-            self.make_linker.is_none(),
-            "Cannot use 'preload_bytes' with a custom linker"
-        );
-        self.preload_bytes.push((name.to_owned(), module_bytes));
-        Ok(self)
-    }
-
-    /// The linker to use during initialization rather than the default
-    /// `wasmtime::Linker`.
-    ///
-    /// If you want your Wasm module to be able to import non-WASI functionality
-    /// (or a subset of WASI) during initialization, you can provide a closure
-    /// that returns a `Linker` result. Note, this has the same non-determinism
-    /// concerns that `.allow_wasi(true)` does: if the allowed imports interact
-    /// with the world in some way, the outcome of that interaction will be
-    /// snapshotted by Wizer during initialization and will yield the same result
-    /// in every instance of the wizened module.
-    pub fn make_linker(
-        &mut self,
-        make_linker: Option<Rc<dyn Fn(&wasmtime::Engine) -> anyhow::Result<Linker>>>,
-    ) -> anyhow::Result<&mut Self> {
-        anyhow::ensure!(
-            !self.allow_wasi,
-            "Cannot use 'allow_wasi' with a custom linker"
-        );
-        self.make_linker = make_linker;
-        Ok(self)
-    }
-
-    /// When using WASI during initialization, should `stdin`, `stdout`, and
+    /// When using WASIX during initialization, should `stdin`, `stdout`, and
     /// `stderr` be inherited?
     ///
     /// Defaults to `true`.
@@ -467,7 +352,7 @@ impl Wizer {
         self
     }
 
-    /// When using WASI during initialization, should the environment variables
+    /// When using WASIX during initialization, should the environment variables
     /// be inherited?
     ///
     /// Defaults to `false`.
@@ -486,7 +371,7 @@ impl Wizer {
         self
     }
 
-    /// When using WASI during initialization, which file system directories
+    /// When using WASIX during initialization, which file system directories
     /// should be made available?
     ///
     /// None are available by default.
@@ -495,7 +380,7 @@ impl Wizer {
         self
     }
 
-    /// When using WASI during initialization, which guest directories should be
+    /// When using WASIX during initialization, which guest directories should be
     /// mapped to a host directory?
     ///
     /// The `map_dir` method differs from `dir` in that it allows giving a custom
@@ -504,7 +389,7 @@ impl Wizer {
     /// None are mapped by default.
     pub fn map_dir(
         &mut self,
-        guest_dir: impl Into<PathBuf>,
+        guest_dir: impl Into<String>,
         host_dir: impl Into<PathBuf>,
     ) -> &mut Self {
         self.map_dirs.push((guest_dir.into(), host_dir.into()));
@@ -554,7 +439,7 @@ impl Wizer {
         let renames = FuncRenames::parse(&self.func_renames)?;
 
         // Make sure we're given valid Wasm from the get go.
-        self.wasm_validate(&wasm)?;
+        self.wasm_validate(wasm)?;
 
         let mut cx = parse::parse(wasm)?;
         let instrumented_wasm = instrument::instrument(&cx);
@@ -573,23 +458,20 @@ impl Wizer {
             }
         }
 
-        let config = self.wasmtime_config()?;
-        let engine = wasmtime::Engine::new(&config)?;
-        let wasi_ctx = self.wasi_context()?;
-        let mut store = wasmtime::Store::new(&engine, wasi_ctx);
-        let module = wasmtime::Module::new(&engine, &instrumented_wasm)
+        let (config, features) = self.wasmer_config();
+        let engine = wasmer::Engine::new(config, Target::default(), features);
+        let runner = self.wasix_runner()?;
+        let runtime = self.wasix_runtime(engine.clone())?;
+        let module = wasmer::Module::new(&engine, &instrumented_wasm)
             .context("failed to compile the Wasm module")?;
+        let mut store = wasmer::Store::new(engine);
         self.validate_init_func(&module)?;
 
-        let (instance, has_wasi_initialize) = self.initialize(&engine, &mut store, &module)?;
+        let (instance, has_wasix_initialize) =
+            self.initialize(&mut store, &module, runtime, runner)?;
         let snapshot = snapshot::snapshot(&mut store, &instance);
-        let rewritten_wasm = self.rewrite(
-            &mut cx,
-            &mut store,
-            &snapshot,
-            &renames,
-            has_wasi_initialize,
-        );
+        let rewritten_wasm =
+            self.rewrite(&mut cx, &store, &snapshot, &renames, has_wasix_initialize);
 
         if cfg!(debug_assertions) {
             if let Err(error) = self.wasm_validate(&rewritten_wasm) {
@@ -606,31 +488,27 @@ impl Wizer {
     }
 
     // NB: keep this in sync with the wasmparser features.
-    fn wasmtime_config(&self) -> anyhow::Result<wasmtime::Config> {
-        let mut config = wasmtime::Config::new();
+    fn wasmer_config(&self) -> (Box<dyn wasmer::CompilerConfig>, Features) {
+        let config = Cranelift::new();
 
-        // Enable Wasmtime's code cache. This makes it so that repeated
-        // wizenings of the same Wasm module (e.g. with different WASI inputs)
-        // doesn't require re-compiling the Wasm to native code every time.
-        config.cache_config_load_default()?;
+        let mut features = Features::new();
 
         // Proposals we support.
-        config.wasm_multi_memory(self.wasm_multi_memory.unwrap_or(DEFAULT_WASM_MULTI_MEMORY));
-        config.wasm_multi_value(self.wasm_multi_value.unwrap_or(DEFAULT_WASM_MULTI_VALUE));
+        features.multi_memory(self.wasm_multi_memory.unwrap_or(DEFAULT_WASM_MULTI_MEMORY));
+        features.multi_value(self.wasm_multi_value.unwrap_or(DEFAULT_WASM_MULTI_VALUE));
         // Note that we only support `memory.copy`, `memory.fill`, and
         // `memory.init` for the time being:
-        config.wasm_bulk_memory(self.wasm_bulk_memory.unwrap_or(DEFAULT_WASM_BULK_MEMORY));
+        features.bulk_memory(self.wasm_bulk_memory.unwrap_or(DEFAULT_WASM_BULK_MEMORY));
 
-        config.wasm_simd(self.wasm_simd.unwrap_or(DEFAULT_WASM_SIMD));
+        features.simd(self.wasm_simd.unwrap_or(DEFAULT_WASM_SIMD));
 
         // Proposals that we should add support for.
-        config.wasm_reference_types(false);
-        config.wasm_threads(false);
+        features.reference_types(false);
 
-        Ok(config)
+        (Box::new(config), features)
     }
 
-    // NB: keep this in sync with the Wasmtime config.
+    // NB: keep this in sync with the wasmer config.
     fn wasm_features(&self) -> wasmparser::WasmFeatures {
         wasmparser::WasmFeatures {
             mutable_global: true,
@@ -643,11 +521,11 @@ impl Wizer {
             // Proposals that we support.
             multi_memory: self.wasm_multi_memory.unwrap_or(DEFAULT_WASM_MULTI_MEMORY),
             multi_value: self.wasm_multi_value.unwrap_or(DEFAULT_WASM_MULTI_VALUE),
+            threads: true,
 
             // Proposals that we should add support for.
             reference_types: false,
             simd: self.wasm_simd.unwrap_or(DEFAULT_WASM_SIMD),
-            threads: false,
             tail_call: false,
             memory64: false,
             exceptions: false,
@@ -717,9 +595,11 @@ impl Wizer {
                             wasmparser::Operator::ElemDrop { .. } => {
                                 anyhow::bail!("unsupported `elem.drop` instruction")
                             }
-                            wasmparser::Operator::DataDrop { .. } => {
-                                anyhow::bail!("unsupported `data.drop` instruction")
-                            }
+                            // TODO @wasmer: WASIX modules seem to like using data.drop at the end of
+                            // __wasm_init_memory, which *should* be harmless here?
+                            // wasmparser::Operator::DataDrop { .. } => {
+                            //     anyhow::bail!("unsupported `data.drop` instruction")
+                            // }
                             wasmparser::Operator::TableSet { .. } => {
                                 unreachable!("part of reference types")
                             }
@@ -739,21 +619,23 @@ impl Wizer {
 
     /// Check that the module exports an initialization function, and that the
     /// function has the correct type.
-    fn validate_init_func(&self, module: &wasmtime::Module) -> anyhow::Result<()> {
+    fn validate_init_func(&self, module: &wasmer::Module) -> anyhow::Result<()> {
         log::debug!("Validating the exported initialization function");
-        match module.get_export(&self.init_func) {
-            Some(wasmtime::ExternType::Func(func_ty)) => {
-                if func_ty.params().len() != 0 || func_ty.results().len() != 0 {
-                    anyhow::bail!(
-                        "the Wasm module's `{}` function export does not have type `[] -> []`",
-                        &self.init_func
-                    );
+        match module.exports().find(|e| e.name() == self.init_func) {
+            Some(export) => match export.ty() {
+                wasmer::ExternType::Function(func_ty) => {
+                    if !func_ty.params().is_empty() || !func_ty.results().is_empty() {
+                        anyhow::bail!(
+                            "the Wasm module's `{}` function export does not have type `[] -> []`",
+                            &self.init_func
+                        );
+                    }
                 }
-            }
-            Some(_) => anyhow::bail!(
-                "the Wasm module's `{}` export is not a function",
-                &self.init_func
-            ),
+                _ => anyhow::bail!(
+                    "the Wasm module's `{}` export is not a function",
+                    &self.init_func
+                ),
+            },
             None => anyhow::bail!(
                 "the Wasm module does not have a `{}` export",
                 &self.init_func
@@ -762,130 +644,121 @@ impl Wizer {
         Ok(())
     }
 
-    fn wasi_context(&self) -> anyhow::Result<Option<WasiCtx>> {
-        if !self.allow_wasi {
+    fn wasix_runner(&self) -> anyhow::Result<Option<WasiRunner>> {
+        if !self.allow_wasix {
             return Ok(None);
         }
 
-        let mut ctx = WasiCtxBuilder::new();
-        if self.inherit_stdio.unwrap_or(DEFAULT_INHERIT_STDIO) {
-            ctx.inherit_stdio();
+        let mut runner = WasiRunner::new();
+
+        runner
+            .with_forward_host_env(self.inherit_env.unwrap_or(DEFAULT_INHERIT_ENV))
+            .with_mapped_directories(self.dirs.iter().map(|dir| {
+                log::debug!("Preopening directory: {}", dir.display());
+                MappedDirectory {
+                    host: dir.clone(),
+                    guest: dir
+                        .to_str()
+                        .expect("Failed to convert path to string")
+                        .to_owned(),
+                }
+            }))
+            .with_mapped_directories(self.map_dirs.iter().map(|(guest, host)| {
+                log::debug!("Preopening directory: {}::{}", guest, host.display());
+                MappedDirectory {
+                    host: host.clone(),
+                    guest: guest.clone(),
+                }
+            }));
+
+        if !self.inherit_stdio.unwrap_or(DEFAULT_INHERIT_STDIO) {
+            runner
+                .with_stdin(Box::<NullFile>::default())
+                .with_stdout(Box::<NullFile>::default())
+                .with_stderr(Box::<NullFile>::default());
         }
-        if self.inherit_env.unwrap_or(DEFAULT_INHERIT_ENV) {
-            ctx.inherit_env()?;
-        }
-        for dir in &self.dirs {
-            log::debug!("Preopening directory: {}", dir.display());
-            let preopened = wasi_common::sync::Dir::open_ambient_dir(
-                dir,
-                wasi_common::sync::ambient_authority(),
-            )
-            .with_context(|| format!("failed to open directory: {}", dir.display()))?;
-            ctx.preopened_dir(preopened, dir)?;
-        }
-        for (guest_dir, host_dir) in &self.map_dirs {
-            log::debug!(
-                "Preopening directory: {}::{}",
-                guest_dir.display(),
-                host_dir.display()
-            );
-            let preopened = wasi_common::sync::Dir::open_ambient_dir(
-                host_dir,
-                wasi_common::sync::ambient_authority(),
-            )
-            .with_context(|| format!("failed to open directory: {}", host_dir.display()))?;
-            ctx.preopened_dir(preopened, guest_dir)?;
-        }
-        Ok(Some(ctx.build()))
+
+        Ok(Some(runner))
     }
 
-    /// Preload a module.
-    fn do_preload(
+    fn wasix_runtime(
         &self,
-        engine: &Engine,
-        store: &mut Store,
-        linker: &mut Linker,
-        name: &str,
-        content: &[u8],
-    ) -> anyhow::Result<()> {
-        let module =
-            wasmtime::Module::new(engine, content).context("failed to parse preload module")?;
-        let instance = wasmtime::Instance::new(&mut *store, &module, &[])
-            .context("failed to instantiate preload module")?;
-        linker
-            .instance(&mut *store, name, instance)
-            .context("failed to add preload's exports to linker")?;
-        Ok(())
+        engine: Engine,
+    ) -> anyhow::Result<Option<Arc<dyn Runtime + Send + Sync>>> {
+        if !self.allow_wasix {
+            return Ok(None);
+        }
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let tokio_task_manager =
+            Arc::new(TokioTaskManager::new(RuntimeOrHandle::from(tokio_runtime)));
+        let mut rt = PluggableRuntime::new(tokio_task_manager);
+        rt.set_engine(Some(engine));
+        Ok(Some(Arc::new(rt)))
     }
 
     /// Instantiate the module and call its initialization function.
     fn initialize(
         &self,
-        engine: &Engine,
         store: &mut Store,
-        module: &wasmtime::Module,
-    ) -> anyhow::Result<(wasmtime::Instance, bool)> {
+        module: &wasmer::Module,
+        runtime: Option<Arc<dyn Runtime + Send + Sync>>,
+        wasi_runner: Option<WasiRunner>,
+    ) -> anyhow::Result<(wasmer::Instance, bool)> {
         log::debug!("Calling the initialization function");
 
-        let mut linker = if let Some(make_linker) = self.make_linker.as_deref() {
-            make_linker(store.engine()).context("failed to make custom linker")?
-        } else {
-            wasmtime::Linker::new(store.engine())
+        let instance = match (
+            wasmer_wasix::is_wasi_module(module) || wasmer_wasix::is_wasix_module(module),
+            runtime,
+            wasi_runner,
+        ) {
+            (true, Some(runtime), Some(runner)) => {
+                let wasi = Wasi::new("wasix-program");
+                let mut env_builder =
+                    runner.prepare_webc_env("wasix-program", &wasi, None, runtime, None)?;
+
+                dummy_imports(&mut *store, module, |module, name, val| {
+                    env_builder.add_import(module.to_owned(), name.to_owned(), val)
+                })?;
+
+                env_builder.instantiate(module.clone(), store)?.0
+            }
+            _ => {
+                let mut imports = Imports::new();
+                dummy_imports(&mut *store, module, |module, name, val| {
+                    imports.define(module, name, val)
+                })?;
+                wasmer::Instance::new(store, module, &imports)?
+            }
         };
 
-        if self.allow_wasi {
-            wasi_common::sync::add_to_linker(&mut linker, |ctx: &mut Option<WasiCtx>| {
-                ctx.as_mut().unwrap()
-            })?;
-        }
+        let mut has_wasix_initialize = false;
 
-        for preload in &self.preload {
-            if let Some((name, value)) = preload.split_once('=') {
-                let content = std::fs::read(value).context("failed to read preload module")?;
-                self.do_preload(engine, &mut *store, &mut linker, &name[..], &content[..])?;
-            } else {
-                anyhow::bail!(
-                    "Bad preload option: {} (must be of form `name=file`)",
-                    preload
-                );
-            }
-        }
-        for (name, bytes) in &self.preload_bytes {
-            self.do_preload(engine, &mut *store, &mut linker, &name[..], &bytes[..])?;
-        }
+        if let Ok(Extern::Function(func)) = instance.exports.get("_initialize") {
+            func.typed::<(), ()>(&store)
+                .and_then(|f| {
+                    has_wasix_initialize = true;
+                    f.call(&mut *store).map_err(Into::into)
+                })
+                .context("calling the Reactor initialization function")?;
 
-        dummy_imports(&mut *store, &module, &mut linker)?;
-
-        let instance = linker
-            .instantiate(&mut *store, module)
-            .context("failed to instantiate the Wasm module")?;
-
-        let mut has_wasi_initialize = false;
-
-        if let Some(export) = instance.get_export(&mut *store, "_initialize") {
-            if let Extern::Func(func) = export {
-                func.typed::<(), ()>(&store)
-                    .and_then(|f| {
-                        has_wasi_initialize = true;
-                        f.call(&mut *store, ()).map_err(Into::into)
-                    })
-                    .context("calling the Reactor initialization function")?;
-
-                if self.init_func == "_initialize" && has_wasi_initialize {
-                    // Don't run `_initialize` twice if the it was explicitly
-                    // requested as the init function.
-                    return Ok((instance, has_wasi_initialize));
-                }
+            if self.init_func == "_initialize" && has_wasix_initialize {
+                // Don't run `_initialize` twice if the it was explicitly
+                // requested as the init function.
+                return Ok((instance, has_wasix_initialize));
             }
         }
 
         let init_func = instance
-            .get_typed_func::<(), ()>(&mut *store, &self.init_func)
+            .exports
+            .get_typed_function::<(), ()>(store, &self.init_func)
             .expect("checked by `validate_init_func`");
         init_func
-            .call(&mut *store, ())
+            .call(&mut *store)
             .with_context(|| format!("the `{}` function trapped", self.init_func))?;
 
-        Ok((instance, has_wasi_initialize))
+        Ok((instance, has_wasix_initialize))
     }
 }
