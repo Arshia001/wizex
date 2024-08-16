@@ -109,6 +109,9 @@ struct DefinedModuleInfo<'a> {
     ///
     /// If this is `None`, then there are no locally defined memories.
     defined_memories_index: Option<u32>,
+
+    /// All data sections defined in this module.
+    datas: Vec<wasmparser::Data<'a>>,
 }
 
 /// A module inside a module linking bundle.
@@ -227,6 +230,10 @@ impl Module {
         cx.defined_mut(self).exports.push(export);
     }
 
+    pub fn push_data<'a>(self, cx: &mut ModuleContext<'a>, data: wasmparser::Data<'a>) {
+        cx.defined_mut(self).datas.push(data);
+    }
+
     /// Is this the root of the module linking bundle?
     pub fn is_root(self) -> bool {
         self.id == 0
@@ -299,5 +306,9 @@ impl Module {
     /// Panics if the types index space does not contain the given index.
     pub fn type_id_at(self, cx: &ModuleContext<'_>, type_index: u32) -> TypeId {
         cx.defined(self).types[usize::try_from(type_index).unwrap()]
+    }
+
+    pub fn datas<'a>(self, cx: &'a ModuleContext) -> &'a [wasmparser::Data<'a>] {
+        &cx.defined(self).datas
     }
 }

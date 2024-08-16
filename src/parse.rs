@@ -49,6 +49,7 @@ pub(crate) fn parse(full_wasm: &[u8]) -> anyhow::Result<ModuleContext> {
             MemorySection(mems) => memory_section(&mut cx, &mut stack, full_wasm, mems)?,
             GlobalSection(globals) => global_section(&mut cx, &mut stack, full_wasm, globals)?,
             ExportSection(exports) => export_section(&mut cx, &mut stack, full_wasm, exports)?,
+            DataSection(data) => data_section(&mut cx, &mut stack, full_wasm, data)?,
             StartSection { func: _, range } => {
                 stack
                     .top_mut()
@@ -65,12 +66,6 @@ pub(crate) fn parse(full_wasm: &[u8]) -> anyhow::Result<ModuleContext> {
                 &mut cx,
                 SectionId::DataCount,
                 range,
-                full_wasm,
-            ),
-            DataSection(data) => stack.top_mut().module.add_raw_section(
-                &mut cx,
-                SectionId::Data,
-                data.range(),
                 full_wasm,
             ),
             CustomSection(c) => stack.top_mut().module.add_raw_section(
@@ -306,5 +301,22 @@ fn export_section<'a>(
             }
         }
     }
+    Ok(())
+}
+
+fn data_section<'a>(
+    cx: &mut ModuleContext<'a>,
+    stack: &mut Vec<StackEntry>,
+    full_wasm: &'a [u8],
+    datas: wasmparser::DataSectionReader<'a>,
+) -> anyhow::Result<()> {
+    let module = stack.top().module;
+    module.add_raw_section(cx, SectionId::Data, datas.range(), full_wasm);
+
+    for data in datas {
+        let data = data?;
+        module.push_data(cx, data);
+    }
+
     Ok(())
 }

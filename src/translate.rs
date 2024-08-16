@@ -1,5 +1,23 @@
 //! Type translator functions from `wasmparser` to `wasm_encoder`.
 
+pub(crate) fn const_expr(expr: wasmparser::ConstExpr) -> wasm_encoder::ConstExpr {
+    match expr.get_operators_reader().read().unwrap() {
+        wasmparser::Operator::F32Const { value } => {
+            wasm_encoder::ConstExpr::f32_const(f32::from_bits(value.bits()))
+        }
+        wasmparser::Operator::F64Const { value } => {
+            wasm_encoder::ConstExpr::f64_const(f64::from_bits(value.bits()))
+        }
+        wasmparser::Operator::I32Const { value } => wasm_encoder::ConstExpr::i32_const(value),
+        wasmparser::Operator::I64Const { value } => wasm_encoder::ConstExpr::i64_const(value),
+        wasmparser::Operator::V128Const { value } => {
+            wasm_encoder::ConstExpr::v128_const(value.i128())
+        }
+
+        _ => panic!("not supported"),
+    }
+}
+
 pub(crate) fn val_type(ty: wasmparser::ValType) -> wasm_encoder::ValType {
     use wasm_encoder::ValType;
     use wasmparser::ValType::*;

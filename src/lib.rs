@@ -597,6 +597,9 @@ impl Wizex {
                             }
                             // TODO @wasmer: WASIX modules seem to like using data.drop at the end of
                             // __wasm_init_memory, which *should* be harmless here?
+                            // Technically, we could leave the dropped data sections out. However, in
+                            // practice, I have no idea how to detect if a data section was dropped or
+                            // not over the lifetime of the initialization function.
                             // wasmparser::Operator::DataDrop { .. } => {
                             //     anyhow::bail!("unsupported `data.drop` instruction")
                             // }

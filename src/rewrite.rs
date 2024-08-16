@@ -3,7 +3,6 @@
 use crate::{
     info::ModuleContext, snapshot::Snapshot, translate, FuncRenames, Wizex, DEFAULT_KEEP_INIT_FUNC,
 };
-use std::convert::TryFrom;
 use wasm_encoder::{ConstExpr, SectionId};
 
 impl Wizex {
@@ -25,10 +24,26 @@ impl Wizex {
 
         // Encode the initialized data segments from the snapshot rather
         // than the original, uninitialized data segments.
-        let mut data_section = if snapshot.data_segments.is_empty() {
-            None
-        } else {
+        let (data_count, mut data_section) = {
             let mut data_section = wasm_encoder::DataSection::new();
+            for data in module.datas(cx) {
+                match data.kind {
+                    wasmparser::DataKind::Passive => {
+                        data_section.passive(data.data.iter().cloned());
+                    }
+                    wasmparser::DataKind::Active {
+                        memory_index,
+                        offset_expr,
+                    } => {
+                        data_section.active(
+                            memory_index,
+                            &translate::const_expr(offset_expr),
+                            data.data.iter().cloned(),
+                        );
+                    }
+                }
+            }
+
             for seg in &snapshot.data_segments {
                 data_section.active(
                     seg.memory_index,
@@ -36,7 +51,15 @@ impl Wizex {
                     seg.data(store).iter().copied(),
                 );
             }
-            Some(data_section)
+
+            (
+                data_section.len(),
+                if data_section.is_empty() {
+                    None
+                } else {
+                    Some(data_section)
+                },
+            )
         };
 
         // There are multiple places were we potentially need to check whether
@@ -139,14 +162,10 @@ impl Wizex {
                 }
 
                 s if s.id == u8::from(SectionId::DataCount) => {
-                    encoder.section(&wasm_encoder::DataCountSection {
-                        count: u32::try_from(snapshot.data_segments.len()).unwrap(),
-                    });
+                    encoder.section(&wasm_encoder::DataCountSection { count: data_count });
                 }
 
                 s if s.id == u8::from(SectionId::Data) => {
-                    // TODO: supporting bulk memory will require copying over
-                    // any passive and declared segments.
                     add_data_section(&mut encoder);
                 }
 
