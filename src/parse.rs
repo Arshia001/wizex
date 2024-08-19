@@ -194,10 +194,14 @@ fn check_import_type(
                 !mem_ty.memory64,
                 "the memory64 proposal is not supported by Wizer yet"
             );
-            anyhow::ensure!(
-                !is_root,
-                "memory imports are not allowed in the root Wasm module"
-            );
+            // TODO @wasmer: Given how WASIX works, I don't think this check makes a lot
+            // of sense, and the end result should be the same regardless of whether
+            // memory is imported or exported. Also, we now fully support imported memory
+            // in wizex, so it makes little sense to keep this check.
+            // anyhow::ensure!(
+            //     !is_root,
+            //     "memory imports are not allowed in the root Wasm module"
+            // );
             Ok(())
         }
         EntityType::Table(_) | EntityType::Global(_) => {

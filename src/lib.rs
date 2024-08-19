@@ -447,7 +447,7 @@ impl Wizex {
         if cfg!(debug_assertions) {
             if let Err(error) = self.wasm_validate(&instrumented_wasm) {
                 #[cfg(feature = "wasmprinter")]
-                let wat = wasmprinter::print_bytes(&wasm)
+                let wat = wasmprinter::print_bytes(&instrumented_wasm)
                     .unwrap_or_else(|e| format!("Disassembling to WAT failed: {}", e));
                 #[cfg(not(feature = "wasmprinter"))]
                 let wat = "`wasmprinter` cargo feature is not enabled".to_string();
@@ -476,7 +476,7 @@ impl Wizex {
         if cfg!(debug_assertions) {
             if let Err(error) = self.wasm_validate(&rewritten_wasm) {
                 #[cfg(feature = "wasmprinter")]
-                let wat = wasmprinter::print_bytes(&wasm)
+                let wat = wasmprinter::print_bytes(&rewritten_wasm)
                     .unwrap_or_else(|e| format!("Disassembling to WAT failed: {}", e));
                 #[cfg(not(feature = "wasmprinter"))]
                 let wat = "`wasmprinter` cargo feature is not enabled".to_string();

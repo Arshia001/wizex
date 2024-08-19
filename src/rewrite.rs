@@ -89,16 +89,45 @@ impl Wizex {
                 // memory.
                 s if s.id == u8::from(SectionId::Memory) => {
                     let mut memories = wasm_encoder::MemorySection::new();
-                    assert_eq!(module.defined_memories_len(cx), snapshot.memory_mins.len());
-                    for ((_, mem), new_min) in module
-                        .defined_memories(cx)
-                        .zip(snapshot.memory_mins.iter().copied())
-                    {
+                    assert_eq!(module.memories_len(cx), snapshot.memory_mins.len());
+                    for ((_, mem), new_min) in module.defined_memories(cx).zip(
+                        snapshot
+                            .memory_mins
+                            .iter()
+                            .skip(module.first_defined_memory_index(cx))
+                            .copied(),
+                    ) {
                         let mut mem = translate::memory_type(mem);
                         mem.minimum = new_min as u64;
                         memories.memory(mem);
                     }
                     encoder.section(&memories);
+                }
+
+                // Do the same for imported memories as well.
+                s if s.id == u8::from(SectionId::Import) => {
+                    let mut imports = wasm_encoder::ImportSection::new();
+
+                    assert_eq!(module.memories_len(cx), snapshot.memory_mins.len());
+                    let mut memory_index = 0;
+
+                    for import in module.imports(cx) {
+                        if let wasmparser::TypeRef::Memory(memory_type) = import.ty {
+                            let mut mem = translate::memory_type(memory_type);
+                            let new_min = snapshot.memory_mins[memory_index];
+                            memory_index += 1;
+                            mem.minimum = new_min as u64;
+                            imports.import(import.module, import.name, mem);
+                        } else {
+                            imports.import(
+                                import.module,
+                                import.name,
+                                translate::import(import.ty),
+                            );
+                        }
+                    }
+
+                    encoder.section(&imports);
                 }
 
                 // Encode the initialized global values from the snapshot,

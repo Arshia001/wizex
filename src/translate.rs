@@ -1,5 +1,7 @@
 //! Type translator functions from `wasmparser` to `wasm_encoder`.
 
+use wasm_encoder::{GlobalType, MemoryType, TableType, TagType};
+
 pub(crate) fn const_expr(expr: wasmparser::ConstExpr) -> wasm_encoder::ConstExpr {
     match expr.get_operators_reader().read().unwrap() {
         wasmparser::Operator::F32Const { value } => {
@@ -32,6 +34,37 @@ pub(crate) fn val_type(ty: wasmparser::ValType) -> wasm_encoder::ValType {
     }
 }
 
+pub(crate) fn ref_type(ty: wasmparser::RefType) -> wasm_encoder::RefType {
+    wasm_encoder::RefType {
+        nullable: ty.is_nullable(),
+        heap_type: match ty.heap_type() {
+            wasmparser::HeapType::Any => wasm_encoder::HeapType::Any,
+            wasmparser::HeapType::Array => wasm_encoder::HeapType::Array,
+            wasmparser::HeapType::Concrete(concrete) => {
+                wasm_encoder::HeapType::Concrete(match concrete {
+                    wasmparser::UnpackedIndex::Module(i) => i,
+                    _ => panic!("not supported"),
+                })
+            }
+            wasmparser::HeapType::Eq => wasm_encoder::HeapType::Eq,
+            wasmparser::HeapType::Exn => wasm_encoder::HeapType::Exn,
+            wasmparser::HeapType::Extern => wasm_encoder::HeapType::Extern,
+            wasmparser::HeapType::Func => wasm_encoder::HeapType::Func,
+            wasmparser::HeapType::I31 => wasm_encoder::HeapType::I31,
+            wasmparser::HeapType::NoExtern => wasm_encoder::HeapType::NoExtern,
+            wasmparser::HeapType::NoFunc => wasm_encoder::HeapType::NoFunc,
+            wasmparser::HeapType::None => wasm_encoder::HeapType::None,
+            wasmparser::HeapType::Struct => wasm_encoder::HeapType::Struct,
+        },
+    }
+}
+
+pub(crate) fn tag_kind(kind: wasmparser::TagKind) -> wasm_encoder::TagKind {
+    match kind {
+        wasmparser::TagKind::Exception => wasm_encoder::TagKind::Exception,
+    }
+}
+
 pub(crate) fn global_type(ty: wasmparser::GlobalType) -> wasm_encoder::GlobalType {
     wasm_encoder::GlobalType {
         val_type: val_type(ty.content_type),
@@ -55,5 +88,30 @@ pub(crate) fn export(kind: wasmparser::ExternalKind) -> wasm_encoder::ExportKind
         wasmparser::ExternalKind::Table => wasm_encoder::ExportKind::Table,
         wasmparser::ExternalKind::Memory => wasm_encoder::ExportKind::Memory,
         wasmparser::ExternalKind::Tag => unreachable!(),
+    }
+}
+
+pub(crate) fn import(ty: wasmparser::TypeRef) -> wasm_encoder::EntityType {
+    match ty {
+        wasmparser::TypeRef::Func(func) => wasm_encoder::EntityType::Function(func),
+        wasmparser::TypeRef::Global(global) => wasm_encoder::EntityType::Global(GlobalType {
+            val_type: val_type(global.content_type),
+            mutable: global.mutable,
+        }),
+        wasmparser::TypeRef::Memory(memory) => wasm_encoder::EntityType::Memory(MemoryType {
+            minimum: memory.initial,
+            maximum: memory.maximum,
+            memory64: memory.memory64,
+            shared: memory.shared,
+        }),
+        wasmparser::TypeRef::Table(table) => wasm_encoder::EntityType::Table(TableType {
+            element_type: ref_type(table.element_type),
+            minimum: table.initial,
+            maximum: table.maximum,
+        }),
+        wasmparser::TypeRef::Tag(tag) => wasm_encoder::EntityType::Tag(TagType {
+            kind: tag_kind(tag.kind),
+            func_type_idx: tag.func_type_idx,
+        }),
     }
 }

@@ -239,6 +239,20 @@ impl Module {
         self.id == 0
     }
 
+    /// The total number of memories in this module.
+    pub fn memories_len(self, cx: &ModuleContext) -> usize {
+        cx.defined(self).memories.len()
+    }
+
+    /// The index of the first defined memory in this module.
+    pub fn first_defined_memory_index(self, cx: &ModuleContext) -> usize {
+        cx.defined(self)
+            .defined_memories_index
+            .map(|i| i as usize)
+            .unwrap_or(0)
+    }
+
+    #[allow(unused)]
     /// The number of defined memories in this module.
     pub fn defined_memories_len(self, cx: &ModuleContext) -> usize {
         let info = cx.defined(self);
@@ -294,6 +308,11 @@ impl Module {
     /// Get a slice of this module's exports.
     pub fn exports<'a, 'b>(self, cx: &'b ModuleContext<'a>) -> &'b [wasmparser::Export<'a>] {
         &cx.defined(self).exports
+    }
+
+    /// Get a slice of this module's imports.
+    pub fn imports<'a, 'b>(self, cx: &'b ModuleContext<'a>) -> &'b [wasmparser::Import<'a>] {
+        &cx.defined(self).imports
     }
 
     /// Get the full types index space for this module.
