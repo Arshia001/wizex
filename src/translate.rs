@@ -30,7 +30,13 @@ pub(crate) fn val_type(ty: wasmparser::ValType) -> wasm_encoder::ValType {
         F64 => ValType::F64,
         V128 => ValType::V128,
         wasmparser::ValType::FUNCREF => ValType::FUNCREF,
-        Ref(_) => panic!("not supported"),
+        wasmparser::ValType::EXTERNREF => ValType::EXTERNREF,
+        Ref(r) => ValType::Ref(wasm_encoder::RefType {
+            nullable: r.is_nullable(),
+            heap_type: wasm_encoder::HeapType::Concrete(
+                r.type_index().unwrap().as_module_index().unwrap(),
+            ),
+        }),
     }
 }
 
@@ -41,10 +47,7 @@ pub(crate) fn ref_type(ty: wasmparser::RefType) -> wasm_encoder::RefType {
             wasmparser::HeapType::Any => wasm_encoder::HeapType::Any,
             wasmparser::HeapType::Array => wasm_encoder::HeapType::Array,
             wasmparser::HeapType::Concrete(concrete) => {
-                wasm_encoder::HeapType::Concrete(match concrete {
-                    wasmparser::UnpackedIndex::Module(i) => i,
-                    _ => panic!("not supported"),
-                })
+                wasm_encoder::HeapType::Concrete(concrete.as_module_index().unwrap())
             }
             wasmparser::HeapType::Eq => wasm_encoder::HeapType::Eq,
             wasmparser::HeapType::Exn => wasm_encoder::HeapType::Exn,
