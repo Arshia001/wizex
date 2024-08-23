@@ -62,6 +62,7 @@ wat = "1.0.71"
 members = [
     "benches/regex-bench",
     "benches/uap-bench",
+    "crates/wizex_macros",
     "fuzz",
     "tests/regex-test",
 ]
