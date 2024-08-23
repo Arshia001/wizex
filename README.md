@@ -84,10 +84,10 @@ $ cargo install wizer --all-features
 ## Example Usage
 
 First, make sure your Wasm module exports an initialization function named
-`wizer.initialize`. For example, in Rust you can export it like this:
+`wizex.initialize`. For example, in Rust you can export it like this:
 
 ```rust
-#[export_name = "wizer.initialize"]
+#[export_name = "wizex.initialize"]
 pub extern "C" fn init() {
     // Your initialization code goes here...
 }

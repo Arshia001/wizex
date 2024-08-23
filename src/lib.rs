@@ -82,7 +82,7 @@ pub struct Wizex {
     /// initialize the Wasm module.
     #[cfg_attr(
         feature = "structopt",
-        structopt(short = "f", long = "init-func", default_value = "wizer.initialize")
+        structopt(short = "f", long = "init-func", default_value = "wizex.initialize")
     )]
     init_func: String,
 
@@ -295,7 +295,7 @@ impl Wizex {
     /// Construct a new `Wizer` builder.
     pub fn new() -> Self {
         Wizex {
-            init_func: "wizer.initialize".into(),
+            init_func: "wizex.initialize".into(),
             func_renames: vec![],
             allow_wasix: false,
             inherit_stdio: None,
@@ -312,7 +312,7 @@ impl Wizex {
 
     /// The export name of the initializer function.
     ///
-    /// Defaults to `"wizer.initialize"`.
+    /// Defaults to `"wizex.initialize"`.
     pub fn init_func(&mut self, init_func: impl Into<String>) -> &mut Self {
         self.init_func = init_func.into();
         self
