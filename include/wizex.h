@@ -1,18 +1,18 @@
 /*
- * Wizer interface for Wasm module to be initialized.
+ * Wizex interface for Wasm module to be initialized.
  *
  * This header provides several macros that allow a Wasm module written in C/C++
  * to declare an initializer function, and ensure that global constructors (in
  * C++'s case) are run at initialization time rather than on startup of the
  * pre-initialized module.
  */
-#ifndef _WIZER_H_
-#define _WIZER_H_
+#ifndef _WIZEX_H_
+#define _WIZEX_H_
 
 #ifdef __cplusplus
-#define __WIZER_EXTERN_C extern "C"
+#define __WIZEX_EXTERN_C extern "C"
 #else
-#define __WIZER_EXTERN_C extern
+#define __WIZEX_EXTERN_C extern
 #endif
 
 #ifdef __clang_major__
@@ -24,20 +24,20 @@
 // wasi-sdk-17 ships with clang-15.0.6
 // wasi-sdk-16 ships with clang-14.0.4
 #if __clang_major__ >= 15 || (__clang_major__ == 14 && __clang_patchlevel__ == 4)
-#define WIZER_MAIN_VOID __main_void
+#define WIZEX_MAIN_VOID __main_void
 #else
-#define WIZER_MAIN_VOID __original_main
+#define WIZEX_MAIN_VOID __original_main
 #endif
 #endif
 
 // We default to assuming that the compiler is new enough to provide
 // __main_void.
-#ifndef WIZER_MAIN_VOID
-#define WIZER_MAIN_VOID __main_void
+#ifndef WIZEX_MAIN_VOID
+#define WIZEX_MAIN_VOID __main_void
 #endif
 
 /*
- * This macro inserts the exported functions necessary to allow Wizer to
+ * This macro inserts the exported functions necessary to allow Wizex to
  * pre-initialize a Wasm module.
  *
  * To use, simply invoke the macro in exactly one compilation unit (C/C++ file)
@@ -45,14 +45,14 @@
  *
  *     static void my_init_function() { ... }
  *
- *     WIZER_INIT(my_init_function);
+ *     WIZEX_INIT(my_init_function);
  *
  * (The macro refers to the provided init function, so it must have been defined
  * or must have a forward declaration at the point the macro is used.)
  *
- * The resulting module should be processed by Wizer as follows:
+ * The resulting module should be processed by Wizex as follows:
  *
- *     $ wizer -r _start=wizer.resume -o out.wasm in.wasm
+ *     $ wizex -r _start=wizex.resume -o out.wasm in.wasm
  *
  * The result of this will be the following behavior:
  *
@@ -62,34 +62,37 @@
  *   `main()` is invoked, then global destructors are run. The initialization
  *   function is *not* run in this case.
  *
- * - During pre-initialization (i.e., during this `wizer` invocation), global
+ * - During pre-initialization (i.e., during this `wizex` invocation), global
  *   constructors will run, and then the provided initialization function will
  *   run. The module's memory and global-variable state is then snapshotted and
  *   saved into `out.wasm`.
  *
- *   All other Wizer restrictions apply (see Wizer documentation for details):
- *   for example, WASI hostcalls may be blocked, depending on options, and
+ *   All other Wizex restrictions apply (see Wizex documentation for details):
+ *   for example, WASI(X) hostcalls may be blocked, depending on options, and
  *   invoking any other imported function will result in an immediate trap
- *   and failure of the Wizer run.
+ *   and failure of the Wizex run.
  *
  * - If the resulting `out.wasm` is then run using the WASI ABI, the program's
  *   global constructors are *not* re-run. Instead, execution starts directly at
  *   `main()`, using the heap and global-variable state left by the global
- *   constructor and initialization function execution during the Wizer
+ *   constructor and initialization function execution during the Wizex
  *   invocation.
  *
  * If no initialization function is needed (i.e., only C++ global constructors
- * should be run), use `WIZER_DEFAULT_INIT()` instead.
+ * should be run), use `WIZEX_DEFAULT_INIT()` instead.
  */
-#define WIZER_INIT(init_func)                                                  \
-    __WIZER_EXTERN_C void __wasm_call_ctors();                                 \
-    __WIZER_EXTERN_C void __wasm_call_dtors();                                 \
-    __WIZER_EXTERN_C void __wasi_proc_exit(int);                               \
-    __WIZER_EXTERN_C int WIZER_MAIN_VOID();                                    \
-    /* This function's export name `wizer.initialize` is specially          */ \
-    /* recognized by Wizer. It is the direct entry point for pre-init.      */ \
-    __attribute__((export_name("wizer.initialize"))) void                      \
-    __wizer_initialize() {                                                     \
+#define WIZEX_INIT(init_func)                                                  \
+    __WIZEX_EXTERN_C void __wasm_call_ctors();                                 \
+    __WIZEX_EXTERN_C void __wasm_call_dtors();                                 \
+    __WIZEX_EXTERN_C void __wasi_init_tp();                                    \
+    __WIZEX_EXTERN_C void __wasi_proc_exit(uint32_t);                          \
+    __WIZEX_EXTERN_C int WIZEX_MAIN_VOID();                                    \
+    /* This function's export name `wizex.initialize` is specially          */ \
+    /* recognized by Wizex. It is the direct entry point for pre-init.      */ \
+    __attribute__((export_name("wizex.initialize"))) void                      \
+    __wizex_initialize()                                                       \
+    {                                                                          \
+        __wasi_init_tp();                                                      \
         /* `__wasm_call_ctors()` is generated by `wasm-ld` and invokes all  */ \
         /* of the global constructors. It is safe (and in fact necessary)   */ \
         /* to manually invoke it here because `wizer.initialize` is the     */ \
@@ -99,9 +102,11 @@
         /* We now invoke the provided init function before returning.       */ \
         init_func();                                                           \
     }                                                                          \
-    /* This function replaces `_start` (the WASI-specified entry point) in  */ \
-    /* the pre-initialized Wasm module.                                     */ \
-    __attribute__((export_name("wizer.resume"))) void __wizer_resume() {       \
+    /* This function replaces `_start` (the WASIX-specified entry point) in */ \
+    /* the pre-initialized Wasm module. To use it, run wizex with the       */ \
+    /* -r _start=wizex.resume CLI argument.                                 */ \
+    __attribute__((export_name("wizex.resume"))) void __wizex_resume()         \
+    {                                                                          \
         /* `__main_void()` is defined by the WASI SDK toolchain due to      */ \
         /* special semantics in C/C++ for the `main()` function, i.e., ito  */ \
         /* can either take argc/argv or not. It collects arguments using    */ \
@@ -109,25 +114,26 @@
         /* `main()`. This may change in the future; when it does, we will   */ \
         /* coordinate with the WASI-SDK toolchain to implement this entry   */ \
         /* point in an alternate way. */                                       \
-        int r = WIZER_MAIN_VOID();                                             \
+        int r = WIZEX_MAIN_VOID();                                             \
         /* Because we are replacing `_start()`, we need to manually invoke  */ \
         /* destructors as well.                                             */ \
         __wasm_call_dtors();                                                   \
         /* If main returned non-zero code, call `__wasi_proc_exit`. */         \
-        if (r != 0) {                                                          \
-          __wasi_proc_exit(r);                                                 \
+        if (r != 0)                                                            \
+        {                                                                      \
+            __wasi_proc_exit(r);                                               \
         }                                                                      \
     }
 
 /*
- * This macro is like `WIZER_INIT()`, but takes no initialization function.
+ * This macro is like `WIZEX_INIT()`, but takes no initialization function.
  * Instead, the pre-initialization phase only executes C++ global constructors
  * before snapshotting the module state.
  *
- * See documentation for `WIZER_INIT()` for more details and usage instructions.
+ * See documentation for `WIZEX_INIT()` for more details and usage instructions.
  */
-#define WIZER_DEFAULT_INIT()      \
+#define WIZEX_DEFAULT_INIT()      \
     static void __empty_init() {} \
-    WIZER_INIT(__empty_init)
+    WIZEX_INIT(__empty_init)
 
-#endif  // _WIZER_H_
+#endif // _WIZEX_H_
