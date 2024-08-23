@@ -1,7 +1,7 @@
-CXX := /opt/wasi-sdk/bin/clang++
-CXXFLAGS := -O2 -I ../../include/
-WIZER := ../../target/release/wizer
-WASMTIME ?= wasmtime
+CXX := clang++
+CXXFLAGS := -O2 -I ../../include/ -target wasm32-wasi --sysroot /opt/wasix-sysroot
+WIZEX := ../../target/release/wizex
+WASMER ?= wasmer
 
 .PHONY: all
 all: main_initialized.wasm
@@ -10,11 +10,11 @@ main.wasm: main.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 main_initialized.wasm: main.wasm
-	$(WIZER) --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume -o $@ $^
+	$(WIZEX) --allow-wasix --wasm-bulk-memory=true -r _start=wizex.resume -o $@ $^
 
 .PHONY: test
 test: main_initialized.wasm
-	$(WASMTIME) run $^
+	$(WASMER) run $^
 
 .PHONY: clean
 clean:
