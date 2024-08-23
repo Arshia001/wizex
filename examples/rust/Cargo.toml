@@ -1,0 +1,7 @@
+[package]
+name = "wizex-rust-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wizex_macros = { path = "../../crates/wizex_macros" }

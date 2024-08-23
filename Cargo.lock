@@ -4297,6 +4297,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wizex-rust-example"
+version = "0.1.0"
+dependencies = [
+ "wizex_macros",
+]
+
+[[package]]
 name = "wizex_macros"
 version = "0.1.0"
 
