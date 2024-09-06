@@ -126,6 +126,32 @@ pub struct Wizex {
     #[cfg_attr(feature = "structopt", structopt(long = "allow-wasix"))]
     allow_wasix: bool,
 
+    /// Provide an additional preloaded module that is available to the
+    /// main module.
+    ///
+    /// This allows running a module that depends on imports from
+    /// another module. Note that the additional module's state is *not*
+    /// snapshotted, nor is its code included in the Wasm snapshot;
+    /// rather, it is assumed that the resulting snapshot Wasm will also
+    /// be executed with the same imports available.
+    ///
+    /// The main purpose of this option is to allow "stubs" for certain
+    /// intrinsics to be included, when these will be provided with
+    /// different implementations when running or further processing the
+    /// snapshot.
+    ///
+    /// The format of this option is `name=file.{wasm,wat}`; e.g.,
+    /// `intrinsics=stubs.wat`. Multiple instances of the option may
+    /// appear.
+    #[cfg_attr(feature = "structopt", structopt(long = "preload"))]
+    preload: Vec<String>,
+
+    /// Like `preload` above, but with the module contents provided,
+    /// rather than a filename. This is more useful for programmatic
+    /// use-cases where the embedding tool may also embed a Wasm module.
+    #[cfg_attr(feature = "structopt", structopt(skip))]
+    preload_bytes: Vec<(String, Vec<u8>)>,
+
     /// When using WASIX during initialization, should `stdin`, `stderr`, and
     /// `stdout` be inherited?
     ///
@@ -216,6 +242,8 @@ impl std::fmt::Debug for Wizex {
             init_func,
             func_renames,
             allow_wasix,
+            preload,
+            preload_bytes,
             inherit_stdio,
             inherit_env,
             keep_init_func,
@@ -230,6 +258,8 @@ impl std::fmt::Debug for Wizex {
             .field("init_func", &init_func)
             .field("func_renames", &func_renames)
             .field("allow_wasix", &allow_wasix)
+            .field("preload", &preload)
+            .field("preload_bytes", &preload_bytes)
             .field("make_linker", &"..")
             .field("inherit_stdio", &inherit_stdio)
             .field("inherit_env", &inherit_env)
@@ -298,6 +328,8 @@ impl Wizex {
             init_func: "wizex.initialize".into(),
             func_renames: vec![],
             allow_wasix: false,
+            preload: vec![],
+            preload_bytes: vec![],
             inherit_stdio: None,
             inherit_env: None,
             keep_init_func: None,
@@ -340,6 +372,53 @@ impl Wizex {
     /// Defaults to `false`.
     pub fn allow_wasix(&mut self, allow: bool) -> anyhow::Result<&mut Self> {
         self.allow_wasix = allow;
+        Ok(self)
+    }
+
+    /// Provide an additional preloaded module that is available to the
+    /// main module.
+    ///
+    /// This allows running a module that depends on imports from
+    /// another module. Note that the additional module's state is *not*
+    /// snapshotted, nor is its code included in the Wasm snapshot;
+    /// rather, it is assumed that the resulting snapshot Wasm will also
+    /// be executed with the same imports available.
+    ///
+    /// The main purpose of this option is to allow "stubs" for certain
+    /// intrinsics to be included, when these will be provided with
+    /// different implementations when running or further processing the
+    /// snapshot.
+    pub fn preload(&mut self, name: &str, filename: &str) -> anyhow::Result<&mut Self> {
+        anyhow::ensure!(
+            !name.contains("="),
+            "Module name cannot contain an `=` character"
+        );
+        self.preload.push(format!("{}={}", name, filename));
+        Ok(self)
+    }
+
+    /// Provide an additional preloaded module that is available to the
+    /// main module. Unlike `preload()`, this method takes an owned
+    /// vector of bytes as the module's actual content, rather than a
+    /// filename. As with `preload()`, the module may be in Wasm binary
+    /// format or in WAT text format.
+    ///
+    /// This allows running a module that depends on imports from
+    /// another module. Note that the additional module's state is *not*
+    /// snapshotted, nor is its code included in the Wasm snapshot;
+    /// rather, it is assumed that the resulting snapshot Wasm will also
+    /// be executed with the same imports available.
+    ///
+    /// The main purpose of this option is to allow "stubs" for certain
+    /// intrinsics to be included, when these will be provided with
+    /// different implementations when running or further processing the
+    /// snapshot.
+    pub fn preload_bytes(
+        &mut self,
+        name: &str,
+        module_bytes: Vec<u8>,
+    ) -> anyhow::Result<&mut Self> {
+        self.preload_bytes.push((name.to_owned(), module_bytes));
         Ok(self)
     }
 
@@ -464,11 +543,12 @@ impl Wizex {
         let runtime = self.wasix_runtime(engine.clone())?;
         let module = wasmer::Module::new(&engine, &instrumented_wasm)
             .context("failed to compile the Wasm module")?;
-        let mut store = wasmer::Store::new(engine);
+        let mut store = wasmer::Store::new(engine.clone());
         self.validate_init_func(&module)?;
 
+        let preloads = self.prepare_preloads(&engine, &mut store)?;
         let (instance, has_wasix_initialize) =
-            self.initialize(&mut store, &module, runtime, runner)?;
+            self.initialize(&mut store, &module, runtime, runner, &preloads)?;
         let snapshot = snapshot::snapshot(&mut store, &instance);
         let rewritten_wasm =
             self.rewrite(&mut cx, &store, &snapshot, &renames, has_wasix_initialize);
@@ -702,6 +782,52 @@ impl Wizex {
         Ok(Some(Arc::new(rt)))
     }
 
+    /// Preload a module.
+    fn instantiate_for_preload(
+        &self,
+        engine: &Engine,
+        store: &mut Store,
+        content: &[u8],
+    ) -> anyhow::Result<wasmer::Instance> {
+        let module =
+            wasmer::Module::new(engine, content).context("failed to parse preload module")?;
+        let imports = wasmer::imports! {};
+        wasmer::Instance::new(&mut *store, &module, &imports)
+            .context("failed to instantiate preload module")
+    }
+
+    fn prepare_preloads(
+        &self,
+        engine: &Engine,
+        store: &mut Store,
+    ) -> anyhow::Result<Vec<(String, wasmer::Instance)>> {
+        let mut result = vec![];
+
+        for preload in &self.preload {
+            if let Some((name, value)) = preload.split_once('=') {
+                let content = std::fs::read(value).context("failed to read preload module")?;
+                result.push((
+                    name.to_owned(),
+                    self.instantiate_for_preload(engine, store, &content[..])?,
+                ));
+            } else {
+                anyhow::bail!(
+                    "Bad preload option: {} (must be of form `name=file`)",
+                    preload
+                );
+            }
+        }
+
+        for (name, bytes) in &self.preload_bytes {
+            result.push((
+                name.clone(),
+                self.instantiate_for_preload(engine, store, &bytes[..])?,
+            ));
+        }
+
+        Ok(result)
+    }
+
     /// Instantiate the module and call its initialization function.
     fn initialize(
         &self,
@@ -709,6 +835,7 @@ impl Wizex {
         module: &wasmer::Module,
         runtime: Option<Arc<dyn Runtime + Send + Sync>>,
         wasi_runner: Option<WasiRunner>,
+        preloads: &Vec<(String, wasmer::Instance)>,
     ) -> anyhow::Result<(wasmer::Instance, bool)> {
         log::debug!("Calling the initialization function");
 
@@ -722,16 +849,32 @@ impl Wizex {
                 let mut env_builder =
                     runner.prepare_webc_env("wasix-program", &wasi, None, runtime, None)?;
 
+                for (name, instance) in preloads {
+                    env_builder.add_imports(
+                        instance
+                            .exports
+                            .clone()
+                            .into_iter()
+                            .map(|(extern_name, extern_)| ((name.clone(), extern_name), extern_)),
+                    )
+                }
                 dummy_imports(&mut *store, module, |module, name, val| {
-                    env_builder.add_import(module.to_owned(), name.to_owned(), val)
+                    if !preloads.iter().any(|p| p.0 == module) {
+                        env_builder.add_import(module.to_owned(), name.to_owned(), val)
+                    }
                 })?;
 
                 env_builder.instantiate(module.clone(), store)?.0
             }
             _ => {
                 let mut imports = Imports::new();
+                for (name, instance) in preloads {
+                    imports.register_namespace(name, instance.exports.clone());
+                }
                 dummy_imports(&mut *store, module, |module, name, val| {
-                    imports.define(module, name, val)
+                    if !preloads.iter().any(|p| p.0 == module) {
+                        imports.define(module, name, val)
+                    }
                 })?;
                 wasmer::Instance::new(store, module, &imports)?
             }

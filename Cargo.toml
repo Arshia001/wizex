@@ -64,7 +64,7 @@ members = [
     "benches/uap-bench",
     "crates/wizex_macros",
     "examples/rust",
-    "fuzz",
+    # "fuzz",
     "tests/regex-test",
 ]
 
