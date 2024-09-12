@@ -539,8 +539,30 @@ impl Wizex {
 
         let (config, features) = self.wasmer_config();
         let engine = wasmer::Engine::new(config, Target::default(), features);
+
+        let mut tokio_runtime = {
+            if !self.allow_wasix {
+                None
+            } else {
+                Some(
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?,
+                )
+            }
+        };
+
+        let tokio_runtime_handle = tokio_runtime.as_ref().map(|r| r.handle().clone());
+        let _guard = tokio_runtime_handle.as_ref().map(|h| h.enter());
+
+        let runtime = tokio_runtime.take().map(|r| {
+            let tokio_task_manager = Arc::new(TokioTaskManager::new(RuntimeOrHandle::from(r)));
+            let mut rt = PluggableRuntime::new(tokio_task_manager);
+            rt.set_engine(Some(engine.clone()));
+            Arc::new(rt) as Arc<dyn Runtime + Send + Sync>
+        });
+
         let runner = self.wasix_runner()?;
-        let runtime = self.wasix_runtime(engine.clone())?;
         let module = wasmer::Module::new(&engine, &instrumented_wasm)
             .context("failed to compile the Wasm module")?;
         let mut store = wasmer::Store::new(engine.clone());
@@ -762,24 +784,6 @@ impl Wizex {
         }
 
         Ok(Some(runner))
-    }
-
-    fn wasix_runtime(
-        &self,
-        engine: Engine,
-    ) -> anyhow::Result<Option<Arc<dyn Runtime + Send + Sync>>> {
-        if !self.allow_wasix {
-            return Ok(None);
-        }
-
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        let tokio_task_manager =
-            Arc::new(TokioTaskManager::new(RuntimeOrHandle::from(tokio_runtime)));
-        let mut rt = PluggableRuntime::new(tokio_task_manager);
-        rt.set_engine(Some(engine));
-        Ok(Some(Arc::new(rt)))
     }
 
     /// Preload a module.

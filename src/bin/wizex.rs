@@ -23,10 +23,7 @@ pub struct Options {
     wizer: Wizex,
 }
 
-// Most of the WASIX code requires a tokio runtime, so let's set one up here all the
-// way at the top.
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
     let options = Options::from_args();
 
