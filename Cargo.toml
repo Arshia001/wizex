@@ -48,8 +48,8 @@ optional = true
 
 [workspace.dependencies]
 wasmprinter = "0.202.0"
-wasmer = "4.3.6"
-wasmer-wasix = "0.26"
+wasmer = "4.3.7"
+wasmer-wasix = "0.27"
 
 
 [dev-dependencies]
