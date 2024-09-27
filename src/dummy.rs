@@ -7,27 +7,28 @@ use wasmer::*;
 
 /// Create dummy imports for instantiating the module.
 pub fn dummy_imports(
-    store: &mut crate::Store,
-    module: &wasmer::Module,
-    mut define_import: impl FnMut(&str, &str, Extern),
+    store: &mut wasmer::StoreMut,
+    module_imports: impl Iterator<Item = ImportType>,
+    imports: &mut Imports,
 ) -> Result<()> {
     log::debug!("Creating dummy imports");
 
-    for imp in module.imports() {
-        let name = imp.name();
-        let val = dummy_extern(
-            &mut *store,
-            imp.ty(),
-            &format!("'{}' '{}'", imp.module(), name),
-        )?;
-        define_import(imp.module(), name, val);
+    for imp in module_imports {
+        if !imports.exists(imp.module(), imp.name()) && !imp.module().contains("wasi") {
+            let val = dummy_extern(
+                &mut *store,
+                imp.ty(),
+                &format!("'{}' '{}'", imp.module(), imp.name()),
+            )?;
+            imports.define(imp.module(), imp.name(), val);
+        }
     }
 
     Ok(())
 }
 
 /// Construct a dummy `Extern` from its type signature
-pub fn dummy_extern(store: &mut crate::Store, ty: &ExternType, name: &str) -> Result<Extern> {
+pub fn dummy_extern(store: &mut wasmer::StoreMut, ty: &ExternType, name: &str) -> Result<Extern> {
     Ok(match ty {
         ExternType::Function(func_ty) => Extern::Function(dummy_func(store, func_ty, name)),
         ExternType::Global(_) => {
@@ -41,7 +42,7 @@ pub fn dummy_extern(store: &mut crate::Store, ty: &ExternType, name: &str) -> Re
 }
 
 /// Construct a dummy function for the given function type
-pub fn dummy_func(store: &mut crate::Store, ty: &FunctionType, name: &str) -> Function {
+pub fn dummy_func(store: &mut wasmer::StoreMut, ty: &FunctionType, name: &str) -> Function {
     let name = name.to_string();
     Function::new(store, ty, move |_args| {
         Err(RuntimeError::new(format!(

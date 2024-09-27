@@ -28,12 +28,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "structopt")]
 use structopt::StructOpt;
+use wasmer::AsStoreMut;
 use wasmer::{sys::Features, Cranelift, Engine, Extern, Imports, NativeEngineExt, Store, Target};
 use wasmer_wasix::{
     runners::{wasi::WasiRunner, MappedDirectory},
     runtime::task_manager::tokio::{RuntimeOrHandle, TokioTaskManager},
     virtual_fs::NullFile,
-    PluggableRuntime, Runtime,
+    PluggableRuntime,
 };
 use webc::metadata::annotations::Wasi;
 
@@ -558,8 +559,9 @@ impl Wizex {
         let runtime = tokio_runtime.take().map(|r| {
             let tokio_task_manager = Arc::new(TokioTaskManager::new(RuntimeOrHandle::from(r)));
             let mut rt = PluggableRuntime::new(tokio_task_manager);
-            rt.set_engine(Some(engine.clone()));
-            Arc::new(rt) as Arc<dyn Runtime + Send + Sync>
+            rt.set_engine(Some(engine.clone()))
+                .set_networking_implementation(virtual_net::host::LocalNetworking::default());
+            rt
         });
 
         let runner = self.wasix_runner()?;
@@ -568,9 +570,8 @@ impl Wizex {
         let mut store = wasmer::Store::new(engine.clone());
         self.validate_init_func(&module)?;
 
-        let preloads = self.prepare_preloads(&engine, &mut store)?;
         let (instance, has_wasix_initialize) =
-            self.initialize(&mut store, &module, runtime, runner, &preloads)?;
+            self.initialize(&engine, &mut store, &module, runtime, runner)?;
         let snapshot = snapshot::snapshot(&mut store, &instance);
         let rewritten_wasm =
             self.rewrite(&mut cx, &store, &snapshot, &renames, has_wasix_initialize);
@@ -788,31 +789,31 @@ impl Wizex {
 
     /// Preload a module.
     fn instantiate_for_preload(
-        &self,
         engine: &Engine,
-        store: &mut Store,
+        store: &mut wasmer::StoreMut,
         content: &[u8],
     ) -> anyhow::Result<wasmer::Instance> {
         let module =
             wasmer::Module::new(engine, content).context("failed to parse preload module")?;
         let imports = wasmer::imports! {};
-        wasmer::Instance::new(&mut *store, &module, &imports)
+        wasmer::Instance::new(store, &module, &imports)
             .context("failed to instantiate preload module")
     }
 
     fn prepare_preloads(
-        &self,
+        preload: &Vec<String>,
+        preload_bytes: &Vec<(String, Vec<u8>)>,
         engine: &Engine,
-        store: &mut Store,
+        store: &mut wasmer::StoreMut,
     ) -> anyhow::Result<Vec<(String, wasmer::Instance)>> {
         let mut result = vec![];
 
-        for preload in &self.preload {
+        for preload in preload {
             if let Some((name, value)) = preload.split_once('=') {
                 let content = std::fs::read(value).context("failed to read preload module")?;
                 result.push((
                     name.to_owned(),
-                    self.instantiate_for_preload(engine, store, &content[..])?,
+                    Self::instantiate_for_preload(engine, store, &content[..])?,
                 ));
             } else {
                 anyhow::bail!(
@@ -822,10 +823,10 @@ impl Wizex {
             }
         }
 
-        for (name, bytes) in &self.preload_bytes {
+        for (name, bytes) in preload_bytes {
             result.push((
                 name.clone(),
-                self.instantiate_for_preload(engine, store, &bytes[..])?,
+                Self::instantiate_for_preload(engine, store, &bytes[..])?,
             ));
         }
 
@@ -835,11 +836,11 @@ impl Wizex {
     /// Instantiate the module and call its initialization function.
     fn initialize(
         &self,
+        engine: &Engine,
         store: &mut Store,
         module: &wasmer::Module,
-        runtime: Option<Arc<dyn Runtime + Send + Sync>>,
+        runtime: Option<PluggableRuntime>,
         wasi_runner: Option<WasiRunner>,
-        preloads: &Vec<(String, wasmer::Instance)>,
     ) -> anyhow::Result<(wasmer::Instance, bool)> {
         log::debug!("Calling the initialization function");
 
@@ -848,38 +849,53 @@ impl Wizex {
             runtime,
             wasi_runner,
         ) {
-            (true, Some(runtime), Some(runner)) => {
-                let wasi = Wasi::new("wasix-program");
-                let mut env_builder =
-                    runner.prepare_webc_env("wasix-program", &wasi, None, runtime, None)?;
-
-                for (name, instance) in preloads {
-                    env_builder.add_imports(
-                        instance
-                            .exports
-                            .clone()
-                            .into_iter()
-                            .map(|(extern_name, extern_)| ((name.clone(), extern_name), extern_)),
-                    )
-                }
-                dummy_imports(&mut *store, module, |module, name, val| {
-                    if !preloads.iter().any(|p| p.0 == module) {
-                        env_builder.add_import(module.to_owned(), name.to_owned(), val)
+            (true, Some(mut runtime), Some(runner)) => {
+                let engine = engine.clone();
+                let module_imports = module.imports().collect::<Vec<_>>();
+                let preload = self.preload.clone();
+                let preload_bytes = self.preload_bytes.clone();
+                runtime.with_additional_imports(move |store| {
+                    let mut imports = Imports::new();
+                    let preloads = Self::prepare_preloads(
+                        &preload,
+                        &preload_bytes,
+                        &engine,
+                        &mut store.as_store_mut(),
+                    )?;
+                    for (name, instance) in preloads {
+                        imports.register_namespace(&name, instance.exports.clone());
                     }
-                })?;
+                    dummy_imports(
+                        &mut store.as_store_mut(),
+                        module_imports.iter().cloned(),
+                        &mut imports,
+                    )?;
+                    Ok(imports)
+                });
+
+                let wasi = Wasi::new("wasix-program");
+                let env_builder = runner.prepare_webc_env(
+                    "wasix-program",
+                    &wasi,
+                    None,
+                    Arc::new(runtime),
+                    None,
+                )?;
 
                 env_builder.instantiate(module.clone(), store)?.0
             }
             _ => {
                 let mut imports = Imports::new();
+                let preloads = Self::prepare_preloads(
+                    &self.preload,
+                    &self.preload_bytes,
+                    engine,
+                    &mut store.as_store_mut(),
+                )?;
                 for (name, instance) in preloads {
-                    imports.register_namespace(name, instance.exports.clone());
+                    imports.register_namespace(&name, instance.exports.clone());
                 }
-                dummy_imports(&mut *store, module, |module, name, val| {
-                    if !preloads.iter().any(|p| p.0 == module) {
-                        imports.define(module, name, val)
-                    }
-                })?;
+                dummy_imports(&mut store.as_store_mut(), module.imports(), &mut imports)?;
                 wasmer::Instance::new(store, module, &imports)?
             }
         };
