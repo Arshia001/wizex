@@ -2,7 +2,6 @@
 
 use crate::info::{Module, ModuleContext};
 use crate::stack_ext::StackExt;
-use crate::translate;
 use wasm_encoder::SectionId;
 
 /// Instrument the input Wasm so that it exports its memories and globals,
@@ -71,11 +70,6 @@ pub(crate) fn instrument(cx: &ModuleContext<'_>) -> Vec<u8> {
 
         /// Sections in this module info that we are iterating over.
         sections: std::slice::Iter<'a, wasm_encoder::RawSection<'a>>,
-
-        /// The memories we should add for this entry. Kept here because
-        /// there are a couple of places we need to check if we've added
-        /// the memories if we haven't done it yet.
-        memories: Option<wasm_encoder::MemorySection>,
     }
 
     let root = cx.root();
@@ -83,35 +77,6 @@ pub(crate) fn instrument(cx: &ModuleContext<'_>) -> Vec<u8> {
         module: root,
         encoder: wasm_encoder::Module::new(),
         sections: root.raw_sections(cx).iter(),
-        memories: {
-            let mut memories = wasm_encoder::MemorySection::new();
-
-            for import in root.imports(cx) {
-                if let wasmparser::TypeRef::Memory(memory_type) = import.ty {
-                    memories.memory(wasm_encoder::MemoryType {
-                        minimum: memory_type.initial,
-                        maximum: memory_type.maximum,
-                        memory64: memory_type.memory64,
-                        shared: memory_type.shared,
-                    });
-                }
-            }
-
-            for (_, memory) in root.defined_memories(cx) {
-                memories.memory(wasm_encoder::MemoryType {
-                    minimum: memory.initial,
-                    maximum: memory.maximum,
-                    memory64: memory.memory64,
-                    shared: memory.shared,
-                });
-            }
-
-            if memories.is_empty() {
-                None
-            } else {
-                Some(memories)
-            }
-        },
     }];
 
     loop {
@@ -149,69 +114,19 @@ pub(crate) fn instrument(cx: &ModuleContext<'_>) -> Vec<u8> {
                     let name = format!("__wizer_global_{}", i);
                     exports.export(&name, wasm_encoder::ExportKind::Global, j);
                 }
-
-                let mut memory_idx = 0;
-
-                // We turn imported memories into exported ones, and those always start at index 0
-                for import in entry.module.imports(cx) {
-                    if let wasmparser::TypeRef::Memory(_) = import.ty {
-                        let name = format!("__wizer_memory_{}", memory_idx);
-                        exports.export(&name, wasm_encoder::ExportKind::Memory, memory_idx);
-                        memory_idx += 1;
-                    }
-                }
-
-                for (j, _) in entry.module.defined_memories(cx) {
-                    let name = format!("__wizer_memory_{}", memory_idx);
-                    memory_idx += 1;
+                for (i, (j, _)) in entry.module.defined_memories(cx).enumerate() {
+                    let name = format!("__wizer_memory_{}", i);
                     exports.export(&name, wasm_encoder::ExportKind::Memory, j);
                 }
 
-                // If the original module had no memory section but we added one,
-                // add it in above the export section
-                if let Some(memories) = entry.memories.take() {
-                    entry.encoder.section(&memories);
-                }
-
                 entry.encoder.section(&exports);
-            }
-
-            // We turn imported memories into exported ones, so we need to modify the
-            // memory section to add memories with the same definitions in
-            Some(section) if section.id == u8::from(SectionId::Memory) => {
-                let entry = stack.top_mut();
-
-                if let Some(memories) = entry.memories.take() {
-                    entry.encoder.section(&memories);
-                }
-            }
-
-            // We also need to modify the imports section to skip any imported
-            // memories.
-            Some(section) if section.id == u8::from(SectionId::Import) => {
-                let entry = stack.top_mut();
-                let mut imports = wasm_encoder::ImportSection::new();
-
-                for import in entry.module.imports(cx) {
-                    if !matches!(import.ty, wasmparser::TypeRef::Memory(_)) {
-                        imports.import(import.module, import.name, translate::import(import.ty));
-                    }
-                }
-
-                entry.encoder.section(&imports);
             }
 
             // End of the current module: if this is the root, return the
             // instrumented module, otherwise add it as an entry in its parent's
             // module section.
             None => {
-                let mut entry = stack.pop().unwrap();
-
-                // If the original module had no memory section but we added one,
-                // add it in before finalizing the module
-                if let Some(memories) = entry.memories.take() {
-                    entry.encoder.section(&memories);
-                }
+                let entry = stack.pop().unwrap();
 
                 if entry.module.is_root() {
                     assert!(stack.is_empty());
@@ -222,17 +137,6 @@ pub(crate) fn instrument(cx: &ModuleContext<'_>) -> Vec<u8> {
             // All other sections don't need instrumentation and can be copied
             // over directly.
             Some(section) => {
-                if section.id == u8::from(SectionId::Global)
-                    || section.id == u8::from(SectionId::Tag)
-                {
-                    let entry = stack.top_mut();
-                    // If the original module had no memory section but we added one,
-                    // it should live above global and tag.
-                    if let Some(memories) = entry.memories.take() {
-                        entry.encoder.section(&memories);
-                    }
-                }
-
                 stack.top_mut().encoder.section(section);
             }
         }

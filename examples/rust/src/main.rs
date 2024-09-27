@@ -21,6 +21,7 @@ fn init() {
 fn main() {
     unsafe {
         if !INITIALIZED {
+            println!("Initializing in main");
             init();
         }
         println!(

@@ -183,25 +183,10 @@ fn check_import_type(
     match ty {
         EntityType::Function(_) => Ok(()),
         EntityType::Memory(mem_ty) => {
-            // TODO @wasmer: I believe shared memories can be supported with the existing
-            // code, as long as the initialization function doesn't spawn new threads, which
-            // would be a VERY bad idea anyway.
-            // anyhow::ensure!(
-            //     !mem_ty.shared,
-            //     "shared memories are not supported by Wizer yet"
-            // );
             anyhow::ensure!(
                 !mem_ty.memory64,
                 "the memory64 proposal is not supported by Wizer yet"
             );
-            // TODO @wasmer: Given how WASIX works, I don't think this check makes a lot
-            // of sense, and the end result should be the same regardless of whether
-            // memory is imported or exported. Also, we now fully support imported memory
-            // in wizex, so it makes little sense to keep this check.
-            // anyhow::ensure!(
-            //     !is_root,
-            //     "memory imports are not allowed in the root Wasm module"
-            // );
             Ok(())
         }
         EntityType::Table(_) | EntityType::Global(_) => {

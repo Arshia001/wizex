@@ -1,4 +1,3 @@
-WIZEX := ../../target/release/wizex
 WASMER ?= wasmer
 
 .PHONY: all
@@ -8,7 +7,9 @@ all: main_initialized.wasm
 	cargo wasix build
 
 main_initialized.wasm: ../../target/wasm32-wasmer-wasi/debug/wizex-rust-example.wasm
-	$(WIZEX) --allow-wasix --wasm-bulk-memory=true -r _start=wizex.resume -o $@ $^
+	cargo run --manifest-path ../../Cargo.toml --all-features --bin wizex \
+	  -- \
+	  --allow-wasix --wasm-bulk-memory=true -r _start=wizex.resume -o $@ $^
 
 .PHONY: test
 test: main_initialized.wasm

@@ -14,7 +14,10 @@ pub fn dummy_imports(
     log::debug!("Creating dummy imports");
 
     for imp in module_imports {
-        if !imports.exists(imp.module(), imp.name()) && !imp.module().contains("wasi") {
+        if !(imports.exists(imp.module(), imp.name())
+            || imp.module().contains("wasi")
+            || (imp.module() == "env" && imp.name() == "memory"))
+        {
             let val = dummy_extern(
                 &mut *store,
                 imp.ty(),

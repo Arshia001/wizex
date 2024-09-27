@@ -570,9 +570,9 @@ impl Wizex {
         let mut store = wasmer::Store::new(engine.clone());
         self.validate_init_func(&module)?;
 
-        let (instance, has_wasix_initialize) =
+        let (instance, has_wasix_initialize, imported_memories) =
             self.initialize(&engine, &mut store, &module, runtime, runner)?;
-        let snapshot = snapshot::snapshot(&mut store, &instance);
+        let snapshot = snapshot::snapshot(&mut store, &instance, &imported_memories);
         let rewritten_wasm =
             self.rewrite(&mut cx, &store, &snapshot, &renames, has_wasix_initialize);
 
@@ -841,8 +841,10 @@ impl Wizex {
         module: &wasmer::Module,
         runtime: Option<PluggableRuntime>,
         wasi_runner: Option<WasiRunner>,
-    ) -> anyhow::Result<(wasmer::Instance, bool)> {
+    ) -> anyhow::Result<(wasmer::Instance, bool, Vec<wasmer::Memory>)> {
         log::debug!("Calling the initialization function");
+
+        let mut imported_memories = vec![];
 
         let instance = match (
             wasmer_wasix::is_wasi_module(module) || wasmer_wasix::is_wasix_module(module),
@@ -882,7 +884,22 @@ impl Wizex {
                     None,
                 )?;
 
-                env_builder.instantiate(module.clone(), store)?.0
+                let (instance, env) = env_builder.instantiate(module.clone(), store)?;
+
+                // If the module imports its memory, Wasmer will create one for it, and
+                // we need to get it here so we can read the contents later.
+                if module
+                    .imports()
+                    .any(|i| matches!(i.ty(), wasmer::ExternType::Memory(_)))
+                {
+                    imported_memories.push(
+                        env.data(store)
+                            .try_memory_clone()
+                            .expect("Failed to get WASIX memory"),
+                    );
+                }
+
+                instance
             }
             _ => {
                 let mut imports = Imports::new();
@@ -913,7 +930,7 @@ impl Wizex {
             if self.init_func == "_initialize" && has_wasix_initialize {
                 // Don't run `_initialize` twice if the it was explicitly
                 // requested as the init function.
-                return Ok((instance, has_wasix_initialize));
+                return Ok((instance, has_wasix_initialize, imported_memories));
             }
         }
 
@@ -925,6 +942,6 @@ impl Wizex {
             .call(&mut *store)
             .with_context(|| format!("the `{}` function trapped", self.init_func))?;
 
-        Ok((instance, has_wasix_initialize))
+        Ok((instance, has_wasix_initialize, imported_memories))
     }
 }

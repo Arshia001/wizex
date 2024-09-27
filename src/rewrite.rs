@@ -15,7 +15,7 @@ impl Wizex {
         store: &crate::Store,
         snapshot: &Snapshot,
         renames: &FuncRenames,
-        has_wasi_initialize: bool,
+        has_wasix_initialize: bool,
     ) -> Vec<u8> {
         log::debug!("Rewriting input Wasm to pre-initialized state");
 
@@ -161,7 +161,7 @@ impl Wizex {
                     for export in module.exports(cx) {
                         if (export.name == self.init_func
                             && !self.keep_init_func.unwrap_or(DEFAULT_KEEP_INIT_FUNC))
-                            || (has_wasi_initialize && export.name == "_initialize")
+                            || (has_wasix_initialize && export.name == "_initialize")
                         {
                             continue;
                         }
