@@ -24,7 +24,8 @@ pub struct Options {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    setup_logging();
+
     let options = Options::from_args();
 
     let stdin = io::stdin();
@@ -56,4 +57,26 @@ fn main() -> anyhow::Result<()> {
         .context("failed to write to output")?;
 
     Ok(())
+}
+
+fn setup_logging() {
+    use std::io::IsTerminal;
+
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::{
+        fmt, layer::SubscriberExt, registry, util::SubscriberInitExt, EnvFilter,
+    };
+
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::OFF.into())
+        .from_env_lossy();
+
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_span_events(fmt::format::FmtSpan::CLOSE)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr)
+        .compact();
+
+    registry().with(filter).with(fmt_layer).init();
 }
