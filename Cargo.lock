@@ -4437,11 +4437,11 @@ dependencies = [
 name = "wizex-rust-example"
 version = "0.1.0"
 dependencies = [
- "wizex_macros",
+ "wizex_api",
 ]
 
 [[package]]
-name = "wizex_macros"
+name = "wizex_api"
 version = "0.1.0"
 dependencies = [
  "cc",

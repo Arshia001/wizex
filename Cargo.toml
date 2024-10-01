@@ -68,7 +68,7 @@ wat = "=1.0.71"
 members = [
     "benches/regex-bench",
     "benches/uap-bench",
-    "crates/wizex_macros",
+    "crates/wizex_api",
     "examples/rust",
     # "fuzz",
     "tests/regex-test",

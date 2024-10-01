@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wizex_macros = { path = "../../crates/wizex_macros" }
+wizex_api = { path = "../../crates/wizex_api" }
