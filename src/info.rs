@@ -96,6 +96,17 @@ struct DefinedModuleInfo<'a> {
     /// defined, imported, and aliased in this module.
     functions: Vec<TypeId>,
 
+    /// The index within the function index space where defined functions (as
+    /// opposed to imported or aliased) begin.
+    ///
+    /// If this is `None`, then there are no locally defined functions.
+    defined_functions_index: Option<u32>,
+
+    /// This module's functions.
+    ///
+    /// This is used when adding a new wasix memory_init function.
+    code: Vec<wasm_encoder::Function>,
+
     /// Maps from table index to the table's type for all tables defined,
     /// imported, and aliased in this module.
     tables: Vec<wasmparser::TableType>,
@@ -150,11 +161,15 @@ impl Module {
 
     /// Push a new type into this module's types space.
     pub fn push_type(self, cx: &mut ModuleContext, ty: wasmparser::CompositeType) {
+        let ty = self.insert_type(cx, ty);
+        cx.defined_mut(self).types.push(ty);
+    }
+
+    pub fn insert_type(self, cx: &mut ModuleContext, ty: wasmparser::CompositeType) -> TypeId {
         let types_space = match &cx.arena[self.id] {
             ModuleInfo::Defined(d) => &d.types,
         };
-        let ty = cx.types.insert_wasmparser(ty, types_space);
-        cx.defined_mut(self).types.push(ty);
+        cx.types.insert_wasmparser(ty, types_space)
     }
 
     /// Push a new imported memory into this module's memory index space.
@@ -189,10 +204,26 @@ impl Module {
         info.globals.push(global_type);
     }
 
-    /// Push a new function into this module's function index space.
-    pub fn push_function(self, cx: &mut ModuleContext, func_type: TypeId) {
+    /// Push a new imported function into this module's function index space.
+    pub fn push_imported_function(self, cx: &mut ModuleContext, func_type: TypeId) {
         assert!(cx.types.get(func_type).is_func());
-        cx.defined_mut(self).functions.push(func_type);
+        let info = cx.defined_mut(self);
+        assert!(info.defined_functions_index.is_none());
+        info.functions.push(func_type);
+    }
+
+    /// Push a new defined function into this module's function index space.
+    pub fn push_defined_function(self, cx: &mut ModuleContext, func_type: TypeId) {
+        assert!(cx.types.get(func_type).is_func());
+        let info = cx.defined_mut(self);
+        if info.defined_functions_index.is_none() {
+            info.defined_functions_index = Some(u32::try_from(info.functions.len()).unwrap());
+        }
+        info.functions.push(func_type);
+    }
+
+    pub fn push_code(self, cx: &mut ModuleContext, body: wasm_encoder::Function) {
+        cx.defined_mut(self).code.push(body);
     }
 
     /// Push a new table into this module's table index space.
@@ -214,7 +245,7 @@ impl Module {
             }
             wasmparser::TypeRef::Func(ty_idx) => {
                 let ty = self.type_id_at(cx, ty_idx);
-                self.push_function(cx, ty);
+                self.push_imported_function(cx, ty);
             }
             wasmparser::TypeRef::Table(ty) => {
                 self.push_table(cx, ty);
@@ -295,6 +326,29 @@ impl Module {
                     .map_or(info.globals.len(), |i| usize::try_from(i).unwrap()),
             )
             .map(|(i, g)| (u32::try_from(i).unwrap(), g))
+    }
+
+    pub fn defined_functions<'b>(
+        self,
+        cx: &'b ModuleContext<'_>,
+    ) -> impl Iterator<Item = (u32, TypeId)> + 'b {
+        let info = cx.defined(self);
+        info.functions
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(
+                info.defined_functions_index
+                    .map_or(info.functions.len(), |i| usize::try_from(i).unwrap()),
+            )
+            .map(|(i, g)| (u32::try_from(i).unwrap(), g))
+    }
+
+    pub fn defined_code<'b>(
+        self,
+        cx: &'b ModuleContext<'_>,
+    ) -> impl Iterator<Item = &'b wasm_encoder::Function> + 'b {
+        cx.defined(self).code.iter()
     }
 
     /// Get a slice of this module's original raw sections.

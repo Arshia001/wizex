@@ -4,7 +4,6 @@ use crate::info::{
 };
 use crate::stack_ext::StackExt;
 use anyhow::{Context, Result};
-use std::convert::TryFrom;
 use wasm_encoder::SectionId;
 
 struct StackEntry {
@@ -74,19 +73,18 @@ pub(crate) fn parse(full_wasm: &[u8]) -> anyhow::Result<ModuleContext> {
                 c.range(),
                 full_wasm,
             ),
-            CodeSectionStart {
-                range,
-                count: _,
-                size,
-            } => {
-                wasm = &wasm[usize::try_from(size).unwrap()..];
-                let entry = stack.top_mut();
-                entry.parser.skip_section();
-                entry
+            CodeSectionStart { range, .. } => {
+                stack
+                    .top_mut()
                     .module
                     .add_raw_section(&mut cx, SectionId::Code, range, full_wasm)
             }
-            CodeSectionEntry(_) => unreachable!(),
+            CodeSectionEntry(body) => {
+                stack.top_mut().module.push_code(
+                    &mut cx,
+                    wasm_encoder::Function::from_raw_bytes(full_wasm[body.range()].iter().copied()),
+                );
+            }
             UnknownSection { .. } => anyhow::bail!("unknown section"),
             TagSection(_) => anyhow::bail!("exceptions are not supported yet"),
             End(_) => {
@@ -210,7 +208,7 @@ fn function_section<'a>(
 
     for ty_idx in funcs {
         let ty = module.type_id_at(cx, ty_idx?);
-        module.push_function(cx, ty);
+        module.push_defined_function(cx, ty);
     }
     Ok(())
 }

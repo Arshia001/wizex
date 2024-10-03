@@ -16,16 +16,6 @@ static mut REWIND_STATE: u8 = 0;
 static mut REWIND_ARG: [u8; size_of::<usize>() * 2] = [0u8; size_of::<usize>() * 2];
 static mut REWIND_BUFFER: [u8; REWIND_BUFFER_SIZE] = [0u8; REWIND_BUFFER_SIZE];
 
-fn set_rewind_arg() {
-    unsafe {
-        let buffer_start = addr_of!(REWIND_BUFFER) as usize;
-
-        REWIND_ARG[0..size_of::<usize>()].copy_from_slice(buffer_start.to_ne_bytes().as_ref());
-        REWIND_ARG[size_of::<usize>()..size_of::<usize>() * 2]
-            .copy_from_slice((buffer_start + REWIND_BUFFER_SIZE).to_ne_bytes().as_ref());
-    }
-}
-
 pub fn finalize_init() {
     unsafe {
         match REWIND_STATE {
@@ -37,7 +27,12 @@ pub fn finalize_init() {
             REWIND_STATE_INITIALIZING => {
                 REWIND_STATE = REWIND_STATE_UNWINDING_AFTER_INIT;
 
-                set_rewind_arg();
+                let buffer_start = addr_of!(REWIND_BUFFER) as usize;
+                REWIND_ARG[0..size_of::<usize>()]
+                    .copy_from_slice(buffer_start.to_ne_bytes().as_ref());
+                REWIND_ARG[size_of::<usize>()..size_of::<usize>() * 2]
+                    .copy_from_slice((buffer_start + REWIND_BUFFER_SIZE).to_ne_bytes().as_ref());
+
                 asyncify::start_unwind(addr_of!(REWIND_ARG) as usize);
             }
 

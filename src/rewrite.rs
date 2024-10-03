@@ -1,5 +1,7 @@
 //! Final rewrite pass.
 
+use std::convert::TryInto;
+
 use crate::{
     info::ModuleContext, snapshot::Snapshot, translate, FuncRenames, Wizex, DEFAULT_KEEP_INIT_FUNC,
 };
@@ -16,11 +18,33 @@ impl Wizex {
         snapshot: &Snapshot,
         renames: &FuncRenames,
         has_wasix_initialize: bool,
-    ) -> Vec<u8> {
+        has_wasix_init_memory: bool,
+    ) -> anyhow::Result<Vec<u8>> {
         log::debug!("Rewriting input Wasm to pre-initialized state");
 
         let mut encoder = wasm_encoder::Module::new();
         let module = cx.root();
+
+        let wasix_init_memory_function_idx = if has_wasix_init_memory {
+            Some(
+                module
+                    .imports(cx)
+                    .iter()
+                    .filter(|i| matches!(i.ty, wasmparser::TypeRef::Func(_)))
+                    .count()
+                    + module.defined_functions(cx).count(),
+            )
+        } else {
+            None
+        };
+        let wasix_init_memory_function_type = if has_wasix_init_memory {
+            Some(module.insert_type(
+                cx,
+                wasmparser::CompositeType::Func(wasmparser::FuncType::new([], [])),
+            ))
+        } else {
+            None
+        };
 
         // Encode the initialized data segments from the snapshot rather
         // than the original, uninitialized data segments.
@@ -35,6 +59,9 @@ impl Wizex {
                         memory_index,
                         offset_expr,
                     } => {
+                        if has_wasix_init_memory {
+                            anyhow::bail!("Modules with WASIX concurrent memory initialization logic can't have active data segments");
+                        }
                         data_section.active(
                             memory_index,
                             &translate::const_expr(offset_expr),
@@ -45,11 +72,15 @@ impl Wizex {
             }
 
             for seg in &snapshot.data_segments {
-                data_section.active(
-                    seg.memory_index,
-                    &ConstExpr::i32_const(seg.offset as i32),
-                    seg.data(store).iter().copied(),
-                );
+                if has_wasix_init_memory {
+                    data_section.passive(seg.data(store).iter().copied());
+                } else {
+                    data_section.active(
+                        seg.memory_index,
+                        &ConstExpr::i32_const(seg.offset as i32),
+                        seg.data(store).iter().copied(),
+                    );
+                }
             }
 
             (
@@ -185,9 +216,53 @@ impl Wizex {
                     encoder.section(&exports);
                 }
 
-                // Skip the `start` function -- it's already been run!
+                // Transcribe functions from the original module, and optionally
+                // add the new init_memory function.
+                s if s.id == u8::from(SectionId::Function) => {
+                    let mut function_section = wasm_encoder::FunctionSection::new();
+
+                    for (_, function) in module.defined_functions(cx) {
+                        function_section.function(function.index);
+                    }
+
+                    if has_wasix_init_memory {
+                        function_section.function(
+                            wasix_init_memory_function_type
+                                .expect("Wasix init memory function type not initialized")
+                                .index,
+                        );
+                    }
+
+                    encoder.section(&function_section);
+                }
+
+                s if s.id == u8::from(SectionId::Code) => {
+                    let mut code_section = wasm_encoder::CodeSection::new();
+
+                    for code in module.defined_code(cx) {
+                        code_section.function(code);
+                    }
+
+                    if has_wasix_init_memory {
+                        code_section
+                            .function(&generate_wasix_memory_init_function(cx, &module, snapshot));
+                    }
+
+                    encoder.section(&code_section);
+                }
+
                 s if s.id == u8::from(SectionId::Start) => {
-                    continue;
+                    // We need to generate a new memory_init function if the module is a multi-threaded WASIX module
+                    if has_wasix_init_memory {
+                        encoder.section(&wasm_encoder::StartSection {
+                            function_index: wasix_init_memory_function_idx
+                                .expect("Should have generated a WASIX memory_init function")
+                                .try_into()
+                                .unwrap(),
+                        });
+                    }
+
+                    // otherwise, nothing to do as the start function has already run
                 }
 
                 s if s.id == u8::from(SectionId::DataCount) => {
@@ -206,7 +281,7 @@ impl Wizex {
 
         // Make sure that we've added our data section to the module.
         add_data_section(&mut encoder);
-        encoder.finish()
+        Ok(encoder.finish())
     }
 }
 
@@ -216,3 +291,163 @@ fn is_name_section(s: &wasm_encoder::RawSection) -> bool {
         matches!(reader.read_string(), Ok("name"))
     }
 }
+
+fn generate_wasix_memory_init_function(
+    cx: &ModuleContext<'_>,
+    module: &crate::info::Module,
+    snapshot: &Snapshot,
+) -> wasm_encoder::Function {
+    use wasm_encoder::Instruction as I;
+
+    let defined_datas_count = module.datas(cx).len();
+    let data_segments = snapshot
+        .data_segments
+        .iter()
+        .enumerate()
+        .map(|(n, d)| (n + defined_datas_count, d))
+        .collect::<Vec<_>>();
+
+    // This is really just an arbitrary choice. As far as I know, LLVM (the only compiler we
+    // really, actually use everywhere) leaves the first 1KB of memory untouched, so this
+    // address should be unused. To guard against potential corruption in the future, we
+    // also check if this address was written to while the module was initializing; i.e.
+    // if this falls within any of the snapshot segments.
+    let status_flag_address = 1020_i32;
+    if data_segments.iter().any(|(_, d)| {
+        d.offset < (status_flag_address + 4).try_into().unwrap()
+            && d.offset + d.len > status_flag_address.try_into().unwrap()
+    }) {
+        panic!(
+            "The address chosen for the memory initialization status flag was written to \
+            during module initialization, a new address must be chosen"
+        );
+    }
+
+    let mut function = wasm_encoder::Function::new([]);
+
+    let mut i = |inst| {
+        function.instruction(&inst);
+    };
+
+    i(I::Block(wasm_encoder::BlockType::Empty));
+    {
+        i(I::Block(wasm_encoder::BlockType::Empty));
+        {
+            i(I::Block(wasm_encoder::BlockType::Empty));
+            {
+                // Decide the current status:
+                //  * 0 = not initialized, we should initialize
+                //  * 1 = another thread is initializing the memory, we should wait
+                //  * 2 = already initialized, nothing to do
+                i(I::I32Const(status_flag_address));
+                i(I::I32Const(0));
+                i(I::I32Const(1));
+                i(I::I32AtomicRmwCmpxchg(wasm_encoder::MemArg {
+                    memory_index: 0,
+                    align: 2,
+                    offset: 0,
+                }));
+                i(I::BrTable([0, 1].as_ref().into(), 2));
+
+                i(I::End);
+            }
+
+            for (n, d) in &data_segments {
+                i(I::I32Const(d.offset.try_into().unwrap()));
+                i(I::I32Const(0));
+                i(I::I32Const(d.len.try_into().unwrap()));
+                i(I::MemoryInit {
+                    mem: d.memory_index,
+                    data_index: (*n).try_into().unwrap(),
+                });
+            }
+
+            // Write the status flag to indicate we're done
+            i(I::I32Const(status_flag_address));
+            i(I::I32Const(2));
+            i(I::I32AtomicStore(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+
+            // Notify any threads that are waiting
+            i(I::I32Const(status_flag_address));
+            i(I::I32Const(-1));
+            i(I::MemoryAtomicNotify(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            i(I::Drop);
+
+            // Skip the waiting logic
+            i(I::Br(1));
+
+            i(I::End);
+        }
+
+        i(I::I32Const(status_flag_address));
+        i(I::I32Const(1));
+        i(I::I64Const(-1));
+        i(I::MemoryAtomicWait32(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        i(I::Drop);
+
+        i(I::End);
+    }
+
+    // Drop all the data segments as they're no longer needed
+    for (n, _) in &data_segments {
+        i(I::DataDrop((*n).try_into().unwrap()));
+    }
+
+    // End the function
+    i(I::End);
+
+    function
+}
+
+/*
+X  block ;; label = @1
+X    block ;; label = @2
+X      block ;; label = @3
+X        i32.const 8176
+X        i32.const 0
+X        i32.const 1
+X        i32.atomic.rmw.cmpxchg
+X        br_table 0 (;@3;) 1 (;@2;) 2 (;@1;)
+X      end
+X      i32.const 1024
+X      i32.const 0
+X      i32.const 112
+X      memory.init $.tdata
+X      i32.const 1136
+X      i32.const 0
+X      i32.const 2720
+X      memory.init $.rodata
+X      i32.const 3856
+X      i32.const 0
+X      i32.const 296
+X      memory.init $.data
+X      i32.const 8176
+X      i32.const 2
+X      i32.atomic.store
+X      i32.const 8176
+X      i32.const -1
+X      memory.atomic.notify
+X      drop
+X      br 1 (;@1;)
+X    end
+X    i32.const 8176
+X    i32.const 1
+X    i64.const -1
+X    memory.atomic.wait32
+X    drop
+X  end
+X  data.drop $.rodata
+X  data.drop $.data
+*/

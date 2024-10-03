@@ -43,7 +43,7 @@ pub enum EntityType {
 /// An id of a type in a `TypesInterner` type set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TypeId {
-    index: u32,
+    pub(crate) index: u32,
 }
 
 impl TypesInterner {

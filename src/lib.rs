@@ -570,11 +570,26 @@ impl Wizex {
         let mut store = wasmer::Store::new(engine.clone());
         self.validate_init_func(&module)?;
 
+        // If the module imports any WASI(X) thread-related functions, we want to give it
+        // a memory init function instead of active data segments, since active data segments
+        // and threads don't play nicely together. Basically, each thread is a new instance,
+        // and will overwrite the (shared) memory with data from its active data segments,
+        // which will corrupt the memory.
+        let has_wasix_init_memory = module
+            .imports()
+            .any(|i| i.module().contains("wasi") && i.name().contains("thread"));
+
         let (instance, has_wasix_initialize, imported_memories) =
             self.initialize(&engine, &mut store, &module, runtime, runner)?;
         let snapshot = snapshot::snapshot(&mut store, &instance, &imported_memories);
-        let rewritten_wasm =
-            self.rewrite(&mut cx, &store, &snapshot, &renames, has_wasix_initialize);
+        let rewritten_wasm = self.rewrite(
+            &mut cx,
+            &store,
+            &snapshot,
+            &renames,
+            has_wasix_initialize,
+            has_wasix_init_memory,
+        )?;
 
         if cfg!(debug_assertions) {
             if let Err(error) = self.wasm_validate(&rewritten_wasm) {
