@@ -26,48 +26,43 @@ pub struct DataSegment {
     /// The index of this data segment's memory.
     pub memory_index: u32,
 
-    /// This data segment's initialized memory that it originated from.
-    pub memory: wasmer::Memory,
-
     /// The offset within the memory that `data` should be copied to.
     pub offset: u32,
 
-    /// This segment's length.
-    pub len: u32,
+    /// The actual data from the segment.
+    pub data: Vec<u8>,
 }
 
 impl DataSegment {
-    pub fn data(&self, store: &impl wasmer::AsStoreRef) -> Vec<u8> {
-        let start = usize::try_from(self.offset).unwrap();
-        let end = start + usize::try_from(self.len).unwrap();
-        unsafe { &self.memory.view(store).data_unchecked()[start..end] }.to_vec()
+    /// Length of the data segment.
+    pub fn len(&self) -> u32 {
+        self.data.len() as u32
     }
-}
 
-impl DataSegment {
+    /// Keeping clippy happy!
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// What is the gap between two consecutive data segments?
     ///
     /// `self` must be in front of `other` and they must not overlap with each
     /// other.
-    fn gap(&self, other: &Self) -> u32 {
+    pub fn gap(&self, other: &Self) -> u32 {
         debug_assert_eq!(self.memory_index, other.memory_index);
-        debug_assert!(self.offset + self.len <= other.offset);
-        other.offset - (self.offset + self.len)
+        debug_assert!(self.offset + self.len() <= other.offset);
+        other.offset - (self.offset + self.len())
     }
 
     /// Merge two consecutive data segments.
     ///
     /// `self` must be in front of `other` and they must not overlap with each
     /// other.
-    fn merge(&self, other: &Self) -> DataSegment {
+    pub fn merge(&mut self, other: &Self) {
         let gap = self.gap(other);
 
-        DataSegment {
-            offset: self.offset,
-            len: self.len + gap + other.len,
-            memory: self.memory.clone(),
-            ..*self
-        }
+        self.data.extend(std::iter::repeat(0u8).take(gap as usize));
+        self.data.extend_from_slice(&other.data[..]);
     }
 }
 
@@ -196,8 +191,7 @@ fn snapshot_memories(
 
         // Okay, merge them together into `a` (so that the next iteration can
         // merge it with its predecessor) and then omit `b`!
-        let merged = a.merge(b);
-        *a = merged;
+        a.merge(b);
     }
 
     remove_excess_segments(&mut merged_data_segments);
@@ -240,9 +234,8 @@ fn snapshot_memory(
                 .map_or(page_end, |zero| start + zero);
             segments.push(DataSegment {
                 memory_index,
-                memory: memory.clone(),
                 offset: u32::try_from(start).unwrap(),
-                len: u32::try_from(end - start).unwrap(),
+                data: memory_data[start..end].to_vec(),
             });
             start = end;
         }
@@ -291,8 +284,11 @@ fn remove_excess_segments(merged_data_segments: &mut Vec<DataSegment>) {
     smallest_gaps.sort_unstable_by(|a, b| a.index.cmp(&b.index).reverse());
     for GapIndex { index, .. } in smallest_gaps {
         let index = usize::try_from(index).unwrap();
-        let merged = merged_data_segments[index].merge(&merged_data_segments[index + 1]);
-        merged_data_segments[index] = merged;
+
+        // array[i].do_something(array[j]) is a reborrow, so we split the array
+        // into two slices that we can borrow from simultaneously.
+        let (first, second) = &mut merged_data_segments[..].split_at_mut(index + 1);
+        first[index].merge(&second[0]);
 
         // Okay to use `swap_remove` here because, even though it makes
         // `merged_data_segments` unsorted, the segments are still sorted within

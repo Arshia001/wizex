@@ -14,7 +14,6 @@ impl Wizex {
     pub(crate) fn rewrite(
         &self,
         cx: &mut ModuleContext<'_>,
-        store: &crate::Store,
         snapshot: &Snapshot,
         renames: &FuncRenames,
         has_wasix_initialize: bool,
@@ -73,12 +72,12 @@ impl Wizex {
 
             for seg in &snapshot.data_segments {
                 if has_wasix_init_memory {
-                    data_section.passive(seg.data(store).iter().copied());
+                    data_section.passive(seg.data.iter().copied());
                 } else {
                     data_section.active(
                         seg.memory_index,
                         &ConstExpr::i32_const(seg.offset as i32),
-                        seg.data(store).iter().copied(),
+                        seg.data.iter().copied(),
                     );
                 }
             }
@@ -164,24 +163,29 @@ impl Wizex {
                 // Encode the initialized global values from the snapshot,
                 // rather than the original values.
                 s if s.id == u8::from(SectionId::Global) => {
-                    let mut globals = wasm_encoder::GlobalSection::new();
-                    for ((_, glob_ty), val) in
-                        module.defined_globals(cx).zip(snapshot.globals.iter())
-                    {
-                        let glob_ty = translate::global_type(glob_ty);
-                        globals.global(
-                            glob_ty,
-                            &match val {
-                                wasmer::Value::I32(x) => ConstExpr::i32_const(*x),
-                                wasmer::Value::I64(x) => ConstExpr::i64_const(*x),
-                                wasmer::Value::F32(x) => ConstExpr::f32_const(*x),
-                                wasmer::Value::F64(x) => ConstExpr::f64_const(*x),
-                                wasmer::Value::V128(x) => ConstExpr::v128_const(*x as i128),
-                                _ => unreachable!(),
-                            },
-                        );
+                    // HACK: let wevalx leave the globals list empty to transcribe.
+                    if snapshot.globals.is_empty() {
+                        encoder.section(s);
+                    } else {
+                        let mut globals = wasm_encoder::GlobalSection::new();
+                        for ((_, glob_ty), val) in
+                            module.defined_globals(cx).zip(snapshot.globals.iter())
+                        {
+                            let glob_ty = translate::global_type(glob_ty);
+                            globals.global(
+                                glob_ty,
+                                &match val {
+                                    wasmer::Value::I32(x) => ConstExpr::i32_const(*x),
+                                    wasmer::Value::I64(x) => ConstExpr::i64_const(*x),
+                                    wasmer::Value::F32(x) => ConstExpr::f32_const(*x),
+                                    wasmer::Value::F64(x) => ConstExpr::f64_const(*x),
+                                    wasmer::Value::V128(x) => ConstExpr::v128_const(*x as i128),
+                                    _ => unreachable!(),
+                                },
+                            );
+                        }
+                        encoder.section(&globals);
                     }
-                    encoder.section(&globals);
                 }
 
                 // Remove exports for the wizer initialization
@@ -313,14 +317,23 @@ fn generate_wasix_memory_init_function(
     // also check if this address was written to while the module was initializing; i.e.
     // if this falls within any of the snapshot segments.
     let status_flag_address = 1020_i32;
-    if data_segments.iter().any(|(_, d)| {
+    if let Some((_, segment)) = data_segments.iter().find(|(_, d)| {
         d.offset < (status_flag_address + 4).try_into().unwrap()
-            && d.offset + d.len > status_flag_address.try_into().unwrap()
+            && d.offset + d.len() > status_flag_address.try_into().unwrap()
     }) {
-        panic!(
-            "The address chosen for the memory initialization status flag was written to \
-            during module initialization, a new address must be chosen"
-        );
+        // If the module contained the same initialization logic we're generating here,
+        // it will have written to this very same address, so we check for that.
+        // The expectation is that 0..1023 should be empty, so we should get a 1-byte
+        // segment with just a 1 or a 2 in it.
+        let is_from_previous_memory_init_run = segment.offset as i32 == status_flag_address
+            && segment.len() == 1
+            && [1u8, 2u8].contains(&segment.data[0]);
+        if !is_from_previous_memory_init_run {
+            panic!(
+                "The address chosen for the memory initialization status flag was written to \
+                during module initialization, a new address must be chosen"
+            );
+        }
     }
 
     let mut function = wasm_encoder::Function::new([]);
@@ -355,7 +368,7 @@ fn generate_wasix_memory_init_function(
             for (n, d) in &data_segments {
                 i(I::I32Const(d.offset.try_into().unwrap()));
                 i(I::I32Const(0));
-                i(I::I32Const(d.len.try_into().unwrap()));
+                i(I::I32Const(d.len().try_into().unwrap()));
                 i(I::MemoryInit {
                     mem: d.memory_index,
                     data_index: (*n).try_into().unwrap(),
@@ -410,44 +423,3 @@ fn generate_wasix_memory_init_function(
 
     function
 }
-
-/*
-X  block ;; label = @1
-X    block ;; label = @2
-X      block ;; label = @3
-X        i32.const 8176
-X        i32.const 0
-X        i32.const 1
-X        i32.atomic.rmw.cmpxchg
-X        br_table 0 (;@3;) 1 (;@2;) 2 (;@1;)
-X      end
-X      i32.const 1024
-X      i32.const 0
-X      i32.const 112
-X      memory.init $.tdata
-X      i32.const 1136
-X      i32.const 0
-X      i32.const 2720
-X      memory.init $.rodata
-X      i32.const 3856
-X      i32.const 0
-X      i32.const 296
-X      memory.init $.data
-X      i32.const 8176
-X      i32.const 2
-X      i32.atomic.store
-X      i32.const 8176
-X      i32.const -1
-X      memory.atomic.notify
-X      drop
-X      br 1 (;@1;)
-X    end
-X    i32.const 8176
-X    i32.const 1
-X    i64.const -1
-X    memory.atomic.wait32
-X    drop
-X  end
-X  data.drop $.rodata
-X  data.drop $.data
-*/

@@ -20,7 +20,10 @@ mod translate;
 /// Re-export wasmer so users can align with our version.
 pub use wasmer;
 
-use anyhow::Context;
+pub use info::ModuleContext;
+pub use snapshot::{DataSegment, Snapshot};
+
+use anyhow::{bail, Context};
 use dummy::dummy_imports;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -275,6 +278,37 @@ impl std::fmt::Debug for Wizex {
     }
 }
 
+/// An instantiated module and everything related to it.
+pub struct InstantiatedModule {
+    /// The engine.
+    pub engine: wasmer::Engine,
+
+    /// The store.
+    pub store: wasmer::Store,
+
+    /// The tokio runtime associated with the module's runner. Should be
+    /// entered via [`InstantiatedModule::enter_tokio_runtime`] before
+    /// running code inside the module.
+    pub tokio_runtime_handle: Option<tokio::runtime::Handle>,
+
+    /// The module.
+    pub module: wasmer::Module,
+
+    /// The instance.
+    pub instance: wasmer::Instance,
+
+    /// The module's imported memories.
+    pub imported_memories: Vec<wasmer::Memory>,
+}
+
+impl InstantiatedModule {
+    /// Enter the tokio runtime associated with this module. Should be performed
+    /// and the returned handle kept alive while running code inside the module.
+    pub fn enter_tokio_runtime(&self) -> Option<tokio::runtime::EnterGuard> {
+        self.tokio_runtime_handle.as_ref().map(|r| r.enter())
+    }
+}
+
 struct FuncRenames {
     /// For a given export name that we encounter in the original module, a map
     /// to a new name, if any, to emit in the output module.
@@ -371,9 +405,9 @@ impl Wizex {
     /// rather than per-instance.
     ///
     /// Defaults to `false`.
-    pub fn allow_wasix(&mut self, allow: bool) -> anyhow::Result<&mut Self> {
+    pub fn allow_wasix(&mut self, allow: bool) -> &mut Self {
         self.allow_wasix = allow;
-        Ok(self)
+        self
     }
 
     /// Provide an additional preloaded module that is available to the
@@ -414,13 +448,9 @@ impl Wizex {
     /// intrinsics to be included, when these will be provided with
     /// different implementations when running or further processing the
     /// snapshot.
-    pub fn preload_bytes(
-        &mut self,
-        name: &str,
-        module_bytes: Vec<u8>,
-    ) -> anyhow::Result<&mut Self> {
+    pub fn preload_bytes(&mut self, name: &str, module_bytes: Vec<u8>) -> &mut Self {
         self.preload_bytes.push((name.to_owned(), module_bytes));
-        Ok(self)
+        self
     }
 
     /// When using WASIX during initialization, should `stdin`, `stdout`, and
@@ -512,17 +542,16 @@ impl Wizex {
         self
     }
 
-    /// Initialize the given Wasm, snapshot it, and return the serialized
-    /// snapshot as a new, pre-initialized Wasm module.
-    pub fn run(&self, wasm: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Parse rename spec.
-        let renames = FuncRenames::parse(&self.func_renames)?;
-
+    /// Parse the given module into a [`ModuleContext`].
+    pub fn parse_module<'a>(&self, wasm: &'a [u8]) -> anyhow::Result<ModuleContext<'a>> {
         // Make sure we're given valid Wasm from the get go.
         self.wasm_validate(wasm)?;
+        parse::parse(wasm)
+    }
 
-        let mut cx = parse::parse(wasm)?;
-        let instrumented_wasm = instrument::instrument(&cx);
+    /// Instrument the module in the provided [`ModuleContext`].
+    pub fn instrument_wasm(&self, cx: &ModuleContext) -> Vec<u8> {
+        let instrumented_wasm = instrument::instrument(cx);
 
         if cfg!(debug_assertions) {
             if let Err(error) = self.wasm_validate(&instrumented_wasm) {
@@ -538,6 +567,35 @@ impl Wizex {
             }
         }
 
+        instrumented_wasm
+    }
+
+    /// Check if the module has a WASIX _initialize function.
+    pub fn has_wasix_initialize(&self, instance: &InstantiatedModule) -> bool {
+        let mut has_wasix_initialize = false;
+        if let Ok(Extern::Function(func)) = instance.instance.exports.get("_initialize") {
+            if func.typed::<(), ()>(&instance.store).is_ok() {
+                has_wasix_initialize = true;
+            }
+        }
+        has_wasix_initialize
+    }
+
+    /// Check if the module has a WASIX memory init function.
+    /// If the module imports any WASI(X) thread-related functions, we want to give it
+    /// a memory init function instead of active data segments, since active data segments
+    /// and threads don't play nicely together. Basically, each thread is a new instance,
+    /// and will overwrite the (shared) memory with data from its active data segments,
+    /// which will corrupt the memory.
+    pub fn has_wasix_init_memory(&self, cx: &ModuleContext) -> bool {
+        cx.root()
+            .imports(cx)
+            .iter()
+            .any(|i| i.module.contains("wasi") && i.name.contains("thread"))
+    }
+
+    /// Instantiate the given module while fulfilling its imports.
+    pub fn instantiate_module(&self, wasm: &[u8]) -> anyhow::Result<InstantiatedModule> {
         let (config, features) = self.wasmer_config();
         let engine = wasmer::Engine::new(config, Target::default(), features);
 
@@ -565,27 +623,46 @@ impl Wizex {
         });
 
         let runner = self.wasix_runner()?;
-        let module = wasmer::Module::new(&engine, &instrumented_wasm)
-            .context("failed to compile the Wasm module")?;
+        let module =
+            wasmer::Module::new(&engine, wasm).context("failed to compile the Wasm module")?;
         let mut store = wasmer::Store::new(engine.clone());
-        self.validate_init_func(&module)?;
 
-        // If the module imports any WASI(X) thread-related functions, we want to give it
-        // a memory init function instead of active data segments, since active data segments
-        // and threads don't play nicely together. Basically, each thread is a new instance,
-        // and will overwrite the (shared) memory with data from its active data segments,
-        // which will corrupt the memory.
-        let has_wasix_init_memory = module
-            .imports()
-            .any(|i| i.module().contains("wasi") && i.name().contains("thread"));
+        let (instance, imported_memories) =
+            self.instantiate(&engine, &mut store, &module, runtime, runner)?;
 
-        let (instance, has_wasix_initialize, imported_memories) =
-            self.initialize(&engine, &mut store, &module, runtime, runner)?;
-        let snapshot = snapshot::snapshot(&mut store, &instance, &imported_memories);
+        Ok(InstantiatedModule {
+            engine,
+            store,
+            tokio_runtime_handle,
+            module,
+            instance,
+            imported_memories,
+        })
+    }
+
+    /// Make a snapshot of the instance's memory.
+    pub fn snapshot_module(&self, instance: &mut InstantiatedModule) -> Snapshot {
+        snapshot::snapshot(
+            &mut instance.store,
+            &instance.instance,
+            &instance.imported_memories,
+        )
+    }
+
+    /// Given the initialized snapshot, rewrite the Wasm so that it is already
+    /// initialized.
+    pub fn rewrite_module(
+        &self,
+        cx: &mut ModuleContext,
+        snapshot: &Snapshot,
+        has_wasix_initialize: bool,
+        has_wasix_init_memory: bool,
+    ) -> anyhow::Result<Vec<u8>> {
+        let renames = FuncRenames::parse(&self.func_renames)?;
+
         let rewritten_wasm = self.rewrite(
-            &mut cx,
-            &store,
-            &snapshot,
+            cx,
+            snapshot,
             &renames,
             has_wasix_initialize,
             has_wasix_init_memory,
@@ -601,6 +678,35 @@ impl Wizex {
                 panic!("rewritten Wasm is not valid: {:?}\n\nWAT:\n{}", error, wat);
             }
         }
+
+        Ok(rewritten_wasm)
+    }
+
+    /// Initialize the given Wasm, snapshot it, and return the serialized
+    /// snapshot as a new, pre-initialized Wasm module.
+    pub fn run(&self, wasm: &[u8]) -> anyhow::Result<Vec<u8>> {
+        // Parse rename spec.
+        let mut cx = self.parse_module(wasm)?;
+
+        let instrumented_wasm = self.instrument_wasm(&cx);
+
+        let mut instance = self.instantiate_module(&instrumented_wasm)?;
+        let _enter_guard = instance.enter_tokio_runtime();
+
+        self.validate_init_func(&instance.module)?;
+
+        let has_wasix_initialize = self.has_wasix_initialize(&instance);
+        let has_wasix_init_memory = self.has_wasix_init_memory(&cx);
+        self.call_init_function(&mut instance, has_wasix_initialize)?;
+
+        let snapshot = self.snapshot_module(&mut instance);
+
+        let rewritten_wasm = self.rewrite_module(
+            &mut cx,
+            &snapshot,
+            has_wasix_initialize,
+            has_wasix_init_memory,
+        )?;
 
         Ok(rewritten_wasm)
     }
@@ -848,17 +954,14 @@ impl Wizex {
         Ok(result)
     }
 
-    /// Instantiate the module and call its initialization function.
-    fn initialize(
+    fn instantiate(
         &self,
         engine: &Engine,
         store: &mut Store,
         module: &wasmer::Module,
         runtime: Option<PluggableRuntime>,
         wasi_runner: Option<WasiRunner>,
-    ) -> anyhow::Result<(wasmer::Instance, bool, Vec<wasmer::Memory>)> {
-        log::debug!("Calling the initialization function");
-
+    ) -> anyhow::Result<(wasmer::Instance, Vec<wasmer::Memory>)> {
         let mut imported_memories = vec![];
 
         let instance = match (
@@ -932,31 +1035,42 @@ impl Wizex {
             }
         };
 
-        let mut has_wasix_initialize = false;
+        Ok((instance, imported_memories))
+    }
 
-        if let Ok(Extern::Function(func)) = instance.exports.get("_initialize") {
-            func.typed::<(), ()>(&store)
-                .and_then(|f| {
-                    has_wasix_initialize = true;
-                    f.call(&mut *store).map_err(Into::into)
-                })
+    /// Instantiate the module and call its initialization function.
+    fn call_init_function(
+        &self,
+        instance: &mut InstantiatedModule,
+        has_wasix_initialize: bool,
+    ) -> anyhow::Result<()> {
+        log::debug!("Calling the initialization function");
+
+        if has_wasix_initialize {
+            let Ok(Extern::Function(func)) = instance.instance.exports.get("_initialize") else {
+                bail!("Module was reported to have a wasix _initialize function but it didn't");
+            };
+
+            func.typed::<(), ()>(&instance.store)
+                .and_then(|f| f.call(&mut instance.store).map_err(Into::into))
                 .context("calling the Reactor initialization function")?;
 
             if self.init_func == "_initialize" && has_wasix_initialize {
                 // Don't run `_initialize` twice if the it was explicitly
                 // requested as the init function.
-                return Ok((instance, has_wasix_initialize, imported_memories));
+                return Ok(());
             }
         }
 
         let init_func = instance
+            .instance
             .exports
-            .get_typed_function::<(), ()>(store, &self.init_func)
+            .get_typed_function::<(), ()>(&instance.store, &self.init_func)
             .expect("checked by `validate_init_func`");
         init_func
-            .call(&mut *store)
+            .call(&mut instance.store)
             .with_context(|| format!("the `{}` function trapped", self.init_func))?;
 
-        Ok((instance, has_wasix_initialize, imported_memories))
+        Ok(())
     }
 }

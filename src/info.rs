@@ -6,7 +6,7 @@ use wasm_encoder::SectionId;
 pub mod types_interner;
 
 /// A collection of info about modules within a module linking bundle.
-pub(crate) struct ModuleContext<'a> {
+pub struct ModuleContext<'a> {
     arena: Vec<ModuleInfo<'a>>,
     types: TypesInterner,
 }
@@ -14,7 +14,7 @@ pub(crate) struct ModuleContext<'a> {
 impl<'a> ModuleContext<'a> {
     /// Construct a new `ModuleContext`, pre-populated with an empty root
     /// module.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             arena: vec![ModuleInfo::Defined(DefinedModuleInfo::default())],
             types: TypesInterner::default(),
@@ -130,7 +130,7 @@ struct DefinedModuleInfo<'a> {
 /// This is a small, copy-able type that essentially just indexes into a
 /// `ModuleContext`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Module {
+pub struct Module {
     /// This module's id, aka its pre-order traversal index, aka its index in
     /// `Modules::arena`.
     id: usize,
